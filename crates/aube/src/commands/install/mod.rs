@@ -1,6 +1,5 @@
 use super::make_client;
 use crate::progress::InstallProgress;
-use crate::state;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -15,6 +14,7 @@ mod fetch;
 mod finalize;
 mod frozen;
 mod git_prepare;
+mod gvs;
 mod layout;
 mod lifecycle;
 mod link;
@@ -24,6 +24,7 @@ pub(crate) mod node_gyp_bootstrap;
 mod resolve;
 mod settings;
 mod side_effects_cache;
+mod startup;
 mod summary;
 mod sweep;
 mod unreviewed_builds;
@@ -57,17 +58,20 @@ pub(crate) use settings::{ResolverConfigInputs, configure_resolver};
 pub(crate) use side_effects_cache::{SideEffectsCacheConfig, side_effects_cache_root};
 
 use settings::{
-    check_unmet_peers, default_streaming_network_concurrency, detect_aube_dir_gvs_mode,
-    find_gvs_incompatible_trigger, maybe_cleanup_unused_catalogs, resolve_git_shallow_hosts,
-    resolve_link_concurrency, resolve_network_concurrency, resolve_side_effects_cache,
-    resolve_side_effects_cache_readonly, resolve_strict_peer_dependencies,
-    resolve_strict_store_pkg_content_check, resolve_symlink, resolve_use_running_store_server,
+    check_unmet_peers, default_streaming_network_concurrency, maybe_cleanup_unused_catalogs,
+    resolve_git_shallow_hosts, resolve_link_concurrency, resolve_network_concurrency,
+    resolve_side_effects_cache, resolve_side_effects_cache_readonly,
+    resolve_strict_peer_dependencies, resolve_strict_store_pkg_content_check,
     resolve_verify_store_integrity,
+};
+use startup::{
+    apply_force_state_reset, merge_branch_lockfiles_if_needed, modules_cache_sweep_is_default,
+    resolve_project_cwd, try_install_fast_path, warn_accepted_noop_install_settings,
 };
 use summary::print_already_up_to_date;
 use workspace::{
-    filter_graph_to_importers, filter_graph_to_workspace_selection, importer_project_dir,
-    order_lifecycle_manifests, write_per_project_lockfiles,
+    discover_workspace_plan, filter_graph_to_importers, filter_graph_to_workspace_selection,
+    importer_project_dir, write_per_project_lockfiles,
 };
 
 #[derive(Default)]
@@ -151,18 +155,7 @@ impl InstallPhaseTimings {
 
 pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let mode = opts.mode;
-    let cwd = if let Some(project_dir) = &opts.project_dir {
-        project_dir.clone()
-    } else {
-        // `workspace_or_project_root` gives us workspace-first
-        // precedence: `aube install` from inside a workspace member
-        // installs against the workspace root (not the member as a
-        // standalone project), so members don't get their own
-        // `aube-lock.yaml` / `.aube/` virtual store. Yaml-only roots
-        // install with a synthesized empty manifest at the read site
-        // below.
-        crate::dirs::workspace_or_project_root()?
-    };
+    let cwd = resolve_project_cwd(&opts)?;
     let _lock = super::take_project_lock(&cwd)?;
     let start = std::time::Instant::now();
     let mut phase_timings = InstallPhaseTimings::from_env();
@@ -170,84 +163,11 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     aube_util::diag::instant(aube_util::diag::Category::Install, "begin", None);
     let _diag_install = aube_util::diag::Span::new(aube_util::diag::Category::Install, "total");
 
-    // `--force`: wipe the auto-install state file so the freshness
-    // check in `ensure_installed` can't short-circuit the next run,
-    // and fall through to the normal resolve/link path (which
-    // `into_options` has already flipped to `FrozenMode::No` when
-    // no explicit frozen flag is set). Keeps node_modules in place —
-    // the linker is idempotent, so the relink pass is fast.
-    if opts.force {
-        // Silent swallow lets a permission-denied or Windows-locked
-        // sidecar survive. Next run reads it, matches, short-circuits.
-        // remove_state already maps NotFound to Ok.
-        state::remove_state(&cwd)
-            .map_err(|e| miette!("--force: failed to remove install state: {e}"))?;
-    }
-
-    // `modulesCacheMaxAge` drives the orphan sweep that runs at the
-    // end of every successful install. When users explicitly tune
-    // this setting (e.g. `modulesCacheMaxAge=1` to force sweeping on
-    // every run), the sweep is load-bearing — skipping the full
-    // pipeline would leave planted orphans in place until a dep
-    // change forced a re-install. The default (10080 min = 7 days)
-    // is effectively a no-op on a state-matched warm install (no
-    // orphans accumulate when deps are unchanged), so keep install
-    // fast paths only when the setting is at its default.
-    let modules_cache_sweep_default = super::with_settings_ctx(&cwd, |ctx| {
-        aube_settings::resolved::modules_cache_max_age(ctx) == 10080
-    });
-
-    let missing_lockfile_restore_eligible = matches!(opts.mode, FrozenMode::No)
-        && !opts.force
-        && !opts.lockfile_only
-        && !opts.dep_selection.is_filtered()
-        && !opts.merge_git_branch_lockfiles
-        && !opts.strict_no_lockfile
-        && !opts.dangerously_allow_all_builds
-        && opts.workspace_filter.is_empty()
-        && modules_cache_sweep_default
-        && state::restore_missing_lockfile_if_fresh(&cwd, &opts.cli_flags);
-
-    if missing_lockfile_restore_eligible {
-        unreviewed_builds::emit_warning(&unreviewed_builds::from_state(&cwd));
-        print_already_up_to_date();
+    apply_force_state_reset(&cwd, &opts)?;
+    if try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd)) {
         return Ok(());
     }
 
-    // Warm-path short-circuit: when the state file says the tree is
-    // fresh and no flag demands a full re-run, skip the resolve → fetch
-    // → link pipeline entirely and emit the same "Already up to date"
-    // line the full path would print. Mirrors the check already wired
-    // into `ensure_installed` (see `commands::mod.rs::ensure_installed`).
-    // Gated so any flag that implies real work falls through to the
-    // main pipeline.
-    let warm_path_eligible = matches!(opts.mode, FrozenMode::Frozen | FrozenMode::Prefer)
-        && !opts.force
-        && !opts.lockfile_only
-        && !opts.dep_selection.is_filtered()
-        && !opts.merge_git_branch_lockfiles
-        && !opts.strict_no_lockfile
-        && !opts.dangerously_allow_all_builds
-        && opts.workspace_filter.is_empty()
-        && modules_cache_sweep_default
-        && state::check_needs_install_with_flags(&cwd, &opts.cli_flags).is_none();
-
-    if warm_path_eligible {
-        // Gate on the same condition as `InstallProgress::try_new`:
-        // line-oriented reporters (`--reporter=ndjson`, `--reporter=json`)
-        // and text mode (`-v` / `--silent`) stay silent on no-op installs,
-        // matching the full-path behavior where `prog_ref` is `None` and
-        // `print_install_summary` is never called. `--silent` additionally
-        // has its `SilentStderrGuard` redirect fd 2 to /dev/null, so this
-        // check is belt-and-suspenders for `-v` and the JSON reporters.
-        unreviewed_builds::emit_warning(&unreviewed_builds::from_state(&cwd));
-        print_already_up_to_date();
-        let _ = start;
-        return Ok(());
-    }
-
-    // 1. Read package.json
-    //
     // Yaml-only workspace roots (`pnpm-workspace.yaml` only, no root
     // `package.json`) install with a synthesized empty manifest so
     // every workspace member is installed without the root carrying
@@ -297,68 +217,13 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         opts.strict_no_lockfile,
     )?;
 
-    // Branch-lockfile merge — run *before* any lockfile parsing so the
-    // normal read path picks up the merged `aube-lock.yaml`. Triggered
-    // by either the `--merge-git-branch-lockfiles` flag (one-shot,
-    // ignores patterns) or by the current git branch matching
-    // `mergeGitBranchLockfilesBranchPattern`. Skipped when `lockfile`
-    // is off, since there's nothing to merge into.
-    if lockfile_enabled {
-        let patterns =
-            aube_settings::resolved::merge_git_branch_lockfiles_branch_pattern(&settings_ctx)
-                .unwrap_or_default();
-        let should_merge = opts.merge_git_branch_lockfiles
-            || aube_lockfile::merge::current_branch_matches(&cwd, &patterns);
-        if should_merge {
-            match aube_lockfile::merge_branch_lockfiles(&cwd, &manifest) {
-                Ok(report) => {
-                    if !report.merged_files.is_empty() {
-                        let filenames: Vec<String> = report
-                            .merged_files
-                            .iter()
-                            .filter_map(|p| {
-                                p.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|s| s.to_string())
-                            })
-                            .collect();
-                        tracing::info!(
-                            "merged {} branch lockfile(s) into aube-lock.yaml: {}",
-                            report.merged_files.len(),
-                            filenames.join(", ")
-                        );
-                        if !report.conflicts.is_empty() {
-                            // Surface conflicts to the user, not just
-                            // at warn level. Without this, branch
-                            // lockfile merges silently dropped data:
-                            // override divergences, catalog drift,
-                            // importer pin mismatches, integrity
-                            // differences. All logged at debug only.
-                            // Users saw "N conflicts" with zero
-                            // detail and no hint what lost. Dump
-                            // each conflict on its own line through
-                            // the progress-safe writer so the list
-                            // does not smear the install bar.
-                            crate::progress::safe_eprintln(&format!(
-                                "warn: {} conflict(s) resolved during branch-lockfile merge:",
-                                report.conflicts.len()
-                            ));
-                            for c in &report.conflicts {
-                                crate::progress::safe_eprintln(&format!("warn:   {c}"));
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            "branch-lockfile merge triggered but no aube-lock.*.yaml files were found"
-                        );
-                    }
-                }
-                Err(err) => {
-                    return Err(miette!("failed to merge branch lockfiles: {err}"));
-                }
-            }
-        }
-    }
+    merge_branch_lockfiles_if_needed(
+        &cwd,
+        &manifest,
+        &settings_ctx,
+        lockfile_enabled,
+        opts.merge_git_branch_lockfiles,
+    )?;
 
     // Resolve the install-wide networking / integrity knobs once up
     // front so every downstream fetch site (the lockfile path, the
@@ -387,33 +252,7 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let required_scripts =
         aube_settings::resolved::required_scripts(&settings_ctx).unwrap_or_default();
     validate_required_scripts(&cwd, &manifest, &required_scripts)?;
-    // `useRunningStoreServer`: pnpm-only setting. aube has no
-    // store-daemon, so honoring the strict semantics ("refuse install
-    // unless the daemon is up") would just fail every install for
-    // users with a pnpm-shaped `.npmrc`. Warn once and continue —
-    // matches the docs in `settings.toml`. The warning is emitted
-    // before `InstallProgress::try_new` runs (a few dozen lines down)
-    // so writing straight to stderr can't collide with the animated
-    // progress display.
-    if resolve_use_running_store_server(&settings_ctx) {
-        eprintln!(
-            "warning: aube has no store server; useRunningStoreServer=true is accepted but has no effect"
-        );
-    }
-    // `symlink`: pnpm-parity setting. aube's isolated layout is the
-    // symlink graph under `node_modules/.aube/`, so a hard-copy layout
-    // isn't a supported alternative. Warn once when the user asks for
-    // `symlink=false` and keep building the symlink graph — same
-    // accept-and-warn pattern as `useRunningStoreServer` above, and for
-    // the same reason: a `.npmrc` ported from a pnpm setup should keep
-    // loading instead of failing every install. Emitted before
-    // `InstallProgress::try_new` below so stderr can't collide with the
-    // animated progress display.
-    if !resolve_symlink(&settings_ctx) {
-        eprintln!(
-            "warning: aube's isolated layout requires symlinks; symlink=false is accepted but has no effect"
-        );
-    }
+    warn_accepted_noop_install_settings(&settings_ctx);
     // `dlxCacheMaxAge` has no consumer yet (aube `dlx` uses a
     // tempdir per invocation) but resolving it here keeps the value
     // exercised through the same `ResolveCtx` the rest of the install
@@ -440,99 +279,16 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     // read-side encoding agrees with what the linker actually wrote.
     let virtual_store_dir_max_length = super::resolve_virtual_store_dir_max_length(&settings_ctx);
 
-    // 2. Detect workspace
-    let workspace_packages = aube_workspace::find_workspace_packages(&cwd)
-        .into_diagnostic()
-        .wrap_err("failed to discover workspace packages")?;
-    let recursive_install = aube_settings::resolved::recursive_install(&settings_ctx);
-    let has_workspace = !workspace_packages.is_empty();
-    // Distinct from `has_workspace`: `is_workspace_project` stays
-    // true when every workspace sub-package was just removed from
-    // disk but the workspace yaml / `workspaces` field is still in
-    // place. The lockfile drift check needs this stronger signal so
-    // it still prunes orphan importer entries on the all-packages-
-    // gone boundary, where `manifests` collapses to `[(".", root)]`
-    // and looks indistinguishable from a non-workspace install.
-    let is_workspace_project = aube_workspace::is_workspace_project_root(&cwd);
-    let link_all_workspace_importers =
-        has_workspace && (recursive_install || !opts.workspace_filter.is_empty());
-
-    let mut manifests: Vec<(String, aube_manifest::PackageJson)> =
-        vec![(".".to_string(), manifest.clone())];
-    let mut ws_package_versions: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut ws_dirs: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-
-    if has_workspace {
-        tracing::debug!(
-            "Workspace: {} packages for {project_name}",
-            workspace_packages.len()
-        );
-        for pkg_dir in &workspace_packages {
-            let pkg_manifest = aube_manifest::PackageJson::from_path(&pkg_dir.join("package.json"))
-                .map_err(miette::Report::new)
-                .wrap_err_with(|| format!("failed to read {}/package.json", pkg_dir.display()))?;
-
-            // Importer key uses forward slash. pnpm lockfile convention
-            // is always `/`. `workspace_importer_path` also returns `/`,
-            // so a Windows `\` key here would never match filter lookups
-            // and silently drop the importer from `--filter` installs.
-            // Second risk: Linux CI reading a Windows-written lockfile
-            // sees unknown keys and forces a re-resolve drift.
-            //
-            // `pathdiff` is used (rather than `strip_prefix`) so a
-            // workspace whose `pnpm-workspace.yaml#packages` glob
-            // reaches into the parent tree (`../**`) writes the
-            // importer key as `../sibling` instead of an absolute
-            // path. The lockfile and the linker both read these keys
-            // back through `workspace_importer_path`, which uses the
-            // same relative form.
-            let rel_path = pathdiff::diff_paths(pkg_dir, &cwd)
-                .unwrap_or_else(|| pkg_dir.clone())
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            if let Some(ref name) = pkg_manifest.name {
-                // `version` is optional. pnpm accepts workspace
-                // members without one (real-world: build-only design
-                // systems consumed by an external toolchain, like
-                // tuist's `noora`). When absent, fall back to "0.0.0":
-                // siblings pinning via `workspace:*` / `workspace:^` /
-                // `workspace:~` or bare `*` still link locally
-                // (those branches in resolve_workspace accept any
-                // ws version), and a specific range like
-                // `workspace:^2.0.0` correctly fails to satisfy.
-                let version = pkg_manifest.version.as_deref().unwrap_or("0.0.0");
-                ws_package_versions.insert(name.clone(), version.to_string());
-                ws_dirs.insert(name.clone(), pkg_dir.clone());
-                tracing::debug!("  {name}@{version} ({rel_path})");
-            }
-
-            // `pnpm-workspace.yaml: packages: ["."]` expands to the
-            // root itself; push would produce a duplicate importer
-            // entry (`""` alongside `"."`) since `"."` is seeded at
-            // the top of `manifests`. The resolver would then emit
-            // two `graph.importers` entries mapping to the same
-            // directory, and the linker would race to create the same
-            // top-level symlinks twice. Collapse it here.
-            if !rel_path.is_empty() {
-                manifests.push((rel_path, pkg_manifest));
-            }
-        }
-    }
-
-    let lifecycle_manifests: Vec<(String, aube_manifest::PackageJson)> =
-        if has_workspace && link_all_workspace_importers {
-            order_lifecycle_manifests(
-                manifests
-                    .iter()
-                    .filter(|(importer, _)| aube_linker::is_physical_importer(importer))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            vec![(".".to_string(), manifest.clone())]
-        };
+    let workspace_plan =
+        discover_workspace_plan(&cwd, &manifest, &settings_ctx, &opts.workspace_filter)?;
+    let workspace_packages = workspace_plan.workspace_packages;
+    let has_workspace = workspace_plan.has_workspace;
+    let is_workspace_project = workspace_plan.is_workspace_project;
+    let link_all_workspace_importers = workspace_plan.link_all_workspace_importers;
+    let manifests = workspace_plan.manifests;
+    let ws_package_versions = workspace_plan.ws_package_versions;
+    let ws_dirs = workspace_plan.ws_dirs;
+    let lifecycle_manifests = workspace_plan.lifecycle_manifests;
     let (mut build_policy, policy_warnings) = build_policy_from_manifest_sources(
         lifecycle_manifests.iter().map(|(_, manifest)| manifest),
         &ws_config_shared,
@@ -570,61 +326,8 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
     let prog = InstallProgress::try_new();
     let prog_ref = prog.as_ref();
 
-    // Auto-disable the global virtual store when any importer depends
-    // on a package listed in `disableGlobalVirtualStoreForPackages`
-    // (default: Next.js, Nuxt, Vite, VitePress, Parcel). Those
-    // resolvers follow `node_modules/<pkg>` symlinks to real paths and
-    // then walk up the directory tree looking for configs, app-router
-    // roots, or hoisted deps; gvs makes `.aube/<pkg>` an absolute
-    // symlink into `~/.cache/aube/virtual-store/`, so the walk escapes
-    // the project and can't reach the top-level `node_modules/` where
-    // direct deps live. Plain Webpack and Rollup are deliberately
-    // *not* in the default list — Webpack resolves via the sibling
-    // symlinks aube places inside `.aube/<pkg>/node_modules/`, and
-    // Rollup is rarely a direct dep. The list is the extension
-    // point — add them back (or other tools) here as their failures
-    // surface. `CI=1` already forces per-project mode in `Linker::new`,
-    // so we don't warn in that case (behavior wouldn't change and the
-    // message would just be noise). `virtualStoreOnly` installs skip
-    // the final top-level symlink pass, so the incompatible resolver
-    // never sees the gvs path — suppress the warning there too.
-    let gvs_triggers =
-        aube_settings::resolved::disable_global_virtual_store_for_packages(&settings_ctx);
-    let explicit_global_virtual_store =
-        aube_settings::resolved::enable_global_virtual_store(&settings_ctx);
-    let use_global_virtual_store_override = explicit_global_virtual_store.or_else(|| {
-        let triggered_by = find_gvs_incompatible_trigger(&manifests, &gvs_triggers);
-        // Match `Linker::new`'s exact gvs check — it keys off the `CI`
-        // env var alone, not `npm_config_ci` / `NPM_CONFIG_CI`. Using a
-        // broader set here would silently skip the override (and the
-        // warning) in a scenario where the linker still turns gvs on,
-        // leaving the Turbopack symlink error unmitigated. The snapshot
-        // is populated from `std::env` at `InstallOptions::from_cli`
-        // time, so it reflects the same environment the linker reads.
-        let ci_mode = opts.env_snapshot.iter().any(|(k, _)| k == "CI");
-        let virtual_store_only_setting = aube_settings::resolved::virtual_store_only(&settings_ctx);
-        if let Some(name) = triggered_by
-            && !ci_mode
-            && !virtual_store_only_setting
-        {
-            tracing::warn!(
-                code = aube_codes::warnings::WARN_AUBE_GVS_INCOMPATIBLE,
-                "`{name}` isn't compatible with aube's global virtual store — \
-                 installing per-project instead. Install still succeeds; repeat \
-                 installs of this project just won't share materialized packages \
-                 across projects. Fixing this requires an upstream change in \
-                 `{name}` itself (please file it with that project, not aube). \
-                 To silence this warning, run `aube config set \
-                 enableGlobalVirtualStore false --location project` — or set \
-                 `disableGlobalVirtualStoreForPackages=[]` to opt out of this \
-                 auto-detection entirely. \
-                 Details: https://aube.en.dev/package-manager/global-virtual-store"
-            );
-            Some(false)
-        } else {
-            None
-        }
-    });
+    let use_global_virtual_store_override =
+        gvs::resolve_global_virtual_store_override(&settings_ctx, &manifests, &opts.env_snapshot);
 
     // Remember which lockfile format the project currently uses so
     // every downstream write site (the `--lockfile-only` short-circuit
@@ -722,70 +425,9 @@ pub async fn run(opts: InstallOptions) -> miette::Result<()> {
         return Ok(());
     }
 
-    // Global-virtual-store transition guard. The linker can't reconcile
-    // a mode switch in place — a non-gvs pass landing on a gvs tree
-    // silently re-uses stale symlinks into the shared store, and a gvs
-    // pass landing on a per-project tree fails to unlink the populated
-    // directories before creating its symlinks. When the existing
-    // `.aube/` tree's layout disagrees with the mode this install will
-    // produce, wipe `node_modules/` (and, if `virtualStoreDir` points
-    // outside it, the standalone `.aube/` tree) so the linker rebuilds
-    // from scratch. Matches pnpm's behavior modulo the prompt: pnpm
-    // asks, aube warns and proceeds. `state` goes too so an interrupted
-    // wipe can't leave a half-rebuilt tree behind a stale warm-path
-    // "up to date" verdict. Skipped in `--lockfile-only` /
-    // `enableModulesDir=false` mode (the return above already handled
-    // that case — no node_modules to reconcile).
-    let planned_gvs = use_global_virtual_store_override.unwrap_or_else(|| {
-        // Match `Linker::new`'s default: `CI` unset → gvs on. Reads the
-        // same env snapshot `find_gvs_incompatible_trigger` checked
-        // above, so the two sites can't disagree mid-install.
-        !opts.env_snapshot.iter().any(|(k, _)| k == "CI")
-    });
-    if let Some(existing_gvs) = detect_aube_dir_gvs_mode(&aube_dir)
-        && existing_gvs != planned_gvs
-    {
-        let from = if existing_gvs { "enabled" } else { "disabled" };
-        let to = if planned_gvs { "enabled" } else { "disabled" };
-        let modules_dir_path = cwd.join(&modules_dir_name);
-        tracing::warn!(
-            code = aube_codes::warnings::WARN_AUBE_GVS_MODE_CHANGED,
-            "global virtual store {from} → {to}; removing {} and reinstalling from scratch",
-            modules_dir_path.display()
-        );
-        // Hard-fail the install on a wipe failure instead of swallowing
-        // the error. We've already told the user a wipe was happening,
-        // so proceeding past a half-complete removal would land on the
-        // exact stale mixed-mode tree this guard exists to prevent —
-        // worse than aborting with a clear error the user can act on
-        // (locked file on Windows, permissions, busy mount). A
-        // `NotFound` race (concurrent removal, user deleted the tree
-        // between our classification and the wipe) is benign and stays
-        // silent so the install can proceed.
-        if let Err(e) = std::fs::remove_dir_all(&modules_dir_path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(miette!(
-                "global virtual store transition: failed to remove {}: {e}",
-                modules_dir_path.display()
-            ));
-        }
-        if !aube_dir.starts_with(&modules_dir_path)
-            && let Err(e) = std::fs::remove_dir_all(&aube_dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(miette!(
-                "global virtual store transition: failed to remove {}: {e}",
-                aube_dir.display()
-            ));
-        }
-        // Stale sidecar after GVS transition would match against the
-        // pre-transition tree on next install and short-circuit. Need
-        // to surface remove failure not swallow it.
-        state::remove_state(&cwd).map_err(|e| {
-            miette!("global virtual store transition: failed to remove install state: {e}")
-        })?;
-    }
+    let planned_gvs =
+        gvs::planned_global_virtual_store(use_global_virtual_store_override, &opts.env_snapshot);
+    gvs::reset_on_mode_change(&cwd, &aube_dir, &modules_dir_name, planned_gvs)?;
 
     // 3. Parse or resolve lockfile, streaming tarball fetches during resolution
     let phase_start = std::time::Instant::now();

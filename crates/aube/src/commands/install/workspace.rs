@@ -1,5 +1,107 @@
 use crate::commands::workspace_importer_path;
-use miette::{Context, miette};
+use miette::{Context, IntoDiagnostic, miette};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+pub(super) struct WorkspaceInstallPlan {
+    pub workspace_packages: Vec<PathBuf>,
+    pub has_workspace: bool,
+    pub is_workspace_project: bool,
+    pub link_all_workspace_importers: bool,
+    pub manifests: Vec<(String, aube_manifest::PackageJson)>,
+    pub ws_package_versions: HashMap<String, String>,
+    pub ws_dirs: BTreeMap<String, PathBuf>,
+    pub lifecycle_manifests: Vec<(String, aube_manifest::PackageJson)>,
+}
+
+pub(super) fn discover_workspace_plan(
+    cwd: &Path,
+    root_manifest: &aube_manifest::PackageJson,
+    settings_ctx: &aube_settings::ResolveCtx<'_>,
+    workspace_filter: &aube_workspace::selector::EffectiveFilter,
+) -> miette::Result<WorkspaceInstallPlan> {
+    let workspace_packages = aube_workspace::find_workspace_packages(cwd)
+        .into_diagnostic()
+        .wrap_err("failed to discover workspace packages")?;
+    let recursive_install = aube_settings::resolved::recursive_install(settings_ctx);
+    let has_workspace = !workspace_packages.is_empty();
+    // Distinct from `has_workspace`: `is_workspace_project` stays
+    // true when every workspace sub-package was just removed from
+    // disk but the workspace yaml / `workspaces` field is still in
+    // place. The lockfile drift check needs this stronger signal so
+    // it still prunes orphan importer entries on the all-packages-
+    // gone boundary, where `manifests` collapses to `[(".", root)]`
+    // and looks indistinguishable from a non-workspace install.
+    let is_workspace_project = aube_workspace::is_workspace_project_root(cwd);
+    let link_all_workspace_importers =
+        has_workspace && (recursive_install || !workspace_filter.is_empty());
+
+    let mut manifests = vec![(".".to_string(), root_manifest.clone())];
+    let mut ws_package_versions = HashMap::new();
+    let mut ws_dirs = BTreeMap::new();
+
+    if has_workspace {
+        let project_name = root_manifest.name.as_deref().unwrap_or("(unnamed)");
+        tracing::debug!(
+            "Workspace: {} packages for {project_name}",
+            workspace_packages.len()
+        );
+        for pkg_dir in &workspace_packages {
+            let pkg_manifest = aube_manifest::PackageJson::from_path(&pkg_dir.join("package.json"))
+                .map_err(miette::Report::new)
+                .wrap_err_with(|| format!("failed to read {}/package.json", pkg_dir.display()))?;
+
+            // Importer key uses forward slash. pnpm lockfile convention
+            // is always `/`. `pathdiff` lets workspace globs reach into
+            // parent trees while still writing relative importer keys.
+            let rel_path = pathdiff::diff_paths(pkg_dir, cwd)
+                .unwrap_or_else(|| pkg_dir.clone())
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            if let Some(ref name) = pkg_manifest.name {
+                // pnpm accepts workspace members without versions. Use
+                // "0.0.0" so workspace protocol and bare `*` links can
+                // still resolve locally while specific ranges fail when
+                // they should.
+                let version = pkg_manifest.version.as_deref().unwrap_or("0.0.0");
+                ws_package_versions.insert(name.clone(), version.to_string());
+                ws_dirs.insert(name.clone(), pkg_dir.clone());
+                tracing::debug!("  {name}@{version} ({rel_path})");
+            }
+
+            // `pnpm-workspace.yaml: packages: ["."]` expands to the
+            // root itself; skip the empty relative path because `"."`
+            // is already seeded above.
+            if !rel_path.is_empty() {
+                manifests.push((rel_path, pkg_manifest));
+            }
+        }
+    }
+
+    let lifecycle_manifests = if has_workspace && link_all_workspace_importers {
+        order_lifecycle_manifests(
+            manifests
+                .iter()
+                .filter(|(importer, _)| aube_linker::is_physical_importer(importer))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        vec![(".".to_string(), root_manifest.clone())]
+    };
+
+    Ok(WorkspaceInstallPlan {
+        workspace_packages,
+        has_workspace,
+        is_workspace_project,
+        link_all_workspace_importers,
+        manifests,
+        ws_package_versions,
+        ws_dirs,
+        lifecycle_manifests,
+    })
+}
 
 pub(super) fn filter_graph_to_workspace_selection(
     workspace_root: &std::path::Path,
