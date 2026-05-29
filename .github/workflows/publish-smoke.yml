@@ -65,10 +65,6 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - uses: namespacelabs/nscloud-cache-action@15799a6b54e5765f85b2aac25b3f0df43ed571c0 # v1
-        with:
-          cache: rust
-
       - name: Build aube
         run: cargo build -p aube
 
