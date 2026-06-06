@@ -64,6 +64,34 @@ teardown() {
 	assert_output --partial '"version": "7.7.4"'
 }
 
+@test "aube update -g updates global packages outside a project" {
+	run aube add -g is-positive@1.0.0
+	assert_success
+
+	mkdir -p "$TEST_TEMP_DIR/no-project"
+	cd "$TEST_TEMP_DIR/no-project"
+	assert_file_not_exists package.json
+
+	run aube update -g
+	assert_success
+	refute_output --partial "no package.json found"
+	assert_output --partial "is-positive: 1.0.0 ->"
+
+	run aube list -g
+	assert_success
+	assert_output --partial "is-positive "
+	refute_output --partial "is-positive 1.0.0"
+}
+
+@test "aube update -g fails when any named package is missing" {
+	run aube add -g is-positive@1.0.0
+	assert_success
+
+	run aube update -g is-positive missing-global-package
+	assert_failure
+	assert_output --partial "not globally installed: missing-global-package"
+}
+
 @test "aube add -g creates a hash pointer in the pkg dir" {
 	run aube add -g semver@7.7.4
 	assert_success
