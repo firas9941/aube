@@ -4,6 +4,16 @@ use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+struct ScopedEnvVars(&'static [&'static str]);
+
+impl Drop for ScopedEnvVars {
+    fn drop(&mut self) {
+        for name in self.0 {
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+}
+
 #[test]
 fn parse_npmrc_strips_utf8_bom() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,15 +146,7 @@ fn parse_npmrc_expands_env_in_keys_for_per_uri_auth() {
     // cleanup can't leak these names into the rest of the test
     // run (the harness runs cases in parallel threads on shared
     // process-wide env).
-    struct EnvVars(&'static [&'static str]);
-    impl Drop for EnvVars {
-        fn drop(&mut self) {
-            for name in self.0 {
-                unsafe { std::env::remove_var(name) };
-            }
-        }
-    }
-    let _vars = EnvVars(&["AUBE_TEST_NEXUS_HOST_CFG", "AUBE_TEST_NEXUS_TOKEN_CFG"]);
+    let _vars = ScopedEnvVars(&["AUBE_TEST_NEXUS_HOST_CFG", "AUBE_TEST_NEXUS_TOKEN_CFG"]);
     unsafe {
         std::env::set_var(
             "AUBE_TEST_NEXUS_HOST_CFG",
@@ -178,6 +180,189 @@ fn parse_npmrc_expands_env_in_keys_for_per_uri_auth() {
             .basic_auth_for("https://nexus.example.com/repository/npm/@scope/pkg/-/pkg-1.0.0.tgz"),
         Some("dXNlcjpwYXNz".to_string()),
         "tarball URL under the env-templated host must pick up _auth",
+    );
+}
+
+#[test]
+fn parse_npmrc_untrusted_preserves_env_refs_in_keys_and_values() {
+    let _vars = ScopedEnvVars(&["AUBE_TEST_PROJECT_HOST_CFG", "AUBE_TEST_PROJECT_TOKEN_CFG"]);
+    unsafe {
+        std::env::set_var("AUBE_TEST_PROJECT_HOST_CFG", "//registry.example.com/");
+        std::env::set_var("AUBE_TEST_PROJECT_TOKEN_CFG", "secret-token");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let rc = dir.path().join(".npmrc");
+    std::fs::write(
+        &rc,
+        "${AUBE_TEST_PROJECT_HOST_CFG}:_authToken=${AUBE_TEST_PROJECT_TOKEN_CFG}\n",
+    )
+    .unwrap();
+
+    let entries = parse_npmrc_untrusted(&rc).unwrap();
+
+    assert_eq!(
+        entries,
+        vec![(
+            "${AUBE_TEST_PROJECT_HOST_CFG}:_authToken".to_string(),
+            "${AUBE_TEST_PROJECT_TOKEN_CFG}".to_string(),
+        )]
+    );
+}
+
+#[test]
+fn project_npmrc_does_not_expand_env_into_auth() {
+    let _vars = ScopedEnvVars(&["AUBE_TEST_PROJECT_TOKEN_CFG"]);
+    unsafe { std::env::set_var("AUBE_TEST_PROJECT_TOKEN_CFG", "secret-token") };
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "//registry.example.com/:_authToken=${AUBE_TEST_PROJECT_TOKEN_CFG}\n",
+    )
+    .unwrap();
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+
+    assert_eq!(
+        config.auth_token_for("https://registry.example.com/"),
+        None,
+        "project .npmrc auth env refs must be ignored instead of stored literally",
+    );
+}
+
+#[test]
+fn user_npmrc_still_expands_env_into_auth() {
+    let _vars = ScopedEnvVars(&["AUBE_TEST_USER_TOKEN_CFG"]);
+    unsafe { std::env::set_var("AUBE_TEST_USER_TOKEN_CFG", "secret-token") };
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        "//registry.example.com/:_authToken=${AUBE_TEST_USER_TOKEN_CFG}\n",
+    )
+    .unwrap();
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+
+    assert_eq!(
+        config.auth_token_for("https://registry.example.com/"),
+        Some("secret-token"),
+        "user .npmrc keeps trusted env substitution",
+    );
+}
+
+#[test]
+fn npmrc_auth_file_does_not_expand_env_into_auth() {
+    let _vars = ScopedEnvVars(&["AUBE_TEST_AUTH_FILE_TOKEN_CFG"]);
+    unsafe { std::env::set_var("AUBE_TEST_AUTH_FILE_TOKEN_CFG", "secret-token") };
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let auth_file = project.path().join("auth.npmrc");
+    std::fs::write(
+        &auth_file,
+        "//registry.example.com/:_authToken=${AUBE_TEST_AUTH_FILE_TOKEN_CFG}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        format!("npmrc-auth-file={}\n", auth_file.display()),
+    )
+    .unwrap();
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+
+    assert_eq!(
+        config.auth_token_for("https://registry.example.com/"),
+        None,
+        "auth file loaded through project config inherits project trust and ignores auth env refs",
+    );
+}
+
+#[test]
+fn user_declared_npmrc_auth_file_expands_env_into_auth() {
+    let _vars = ScopedEnvVars(&["AUBE_TEST_USER_AUTH_FILE_TOKEN_CFG"]);
+    unsafe { std::env::set_var("AUBE_TEST_USER_AUTH_FILE_TOKEN_CFG", "secret-token") };
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let auth_file = home.path().join("auth.npmrc");
+    std::fs::write(
+        &auth_file,
+        "//registry.example.com/:_authToken=${AUBE_TEST_USER_AUTH_FILE_TOKEN_CFG}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        format!("npmrc-auth-file={}\n", auth_file.display()),
+    )
+    .unwrap();
+
+    let mut config = NpmConfig::default();
+    config.apply_tagged(load_npmrc_entries_tagged_with_home(
+        Some(home.path()),
+        None,
+        project.path(),
+        None,
+    ));
+
+    assert_eq!(
+        config.auth_token_for("https://registry.example.com/"),
+        Some("secret-token"),
+        "auth file loaded through user config keeps trusted env substitution",
+    );
+}
+
+#[test]
+fn user_declared_npmrc_auth_file_loses_to_project_npmrc() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let auth_file = home.path().join("auth.npmrc");
+    std::fs::write(
+        &auth_file,
+        "//registry.example.com/:_authToken=user-auth-file-token\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".npmrc"),
+        format!("npmrc-auth-file={}\n", auth_file.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".npmrc"),
+        "//registry.example.com/:_authToken=project-token\n",
+    )
+    .unwrap();
+
+    let entries = load_npmrc_entries_with_home(Some(home.path()), None, project.path(), None);
+    let mut config = NpmConfig::default();
+    config.apply(entries);
+
+    assert_eq!(
+        config.auth_token_for("https://registry.example.com/"),
+        Some("project-token"),
+        "user-declared auth file entries should stay in the user precedence layer",
     );
 }
 
