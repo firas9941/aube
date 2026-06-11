@@ -381,6 +381,74 @@ impl LockedPackage {
     pub fn spec_key(&self) -> String {
         format!("{}@{}", self.name, self.version)
     }
+
+    /// Exact approval key for non-registry package sources.
+    ///
+    /// Name-wide build approvals are only trustworthy for packages
+    /// fetched from a registry. Source-backed entries need to be
+    /// approved by their lockfile identity, with any peer suffix
+    /// stripped so the approval survives peer-context reshuffling.
+    pub fn source_approval_key(&self) -> Option<&str> {
+        self.local_source.as_ref()?;
+        Some(
+            self.dep_path
+                .split_once('(')
+                .map_or(&self.dep_path, |(base, _)| base),
+        )
+    }
+}
+
+#[cfg(test)]
+mod locked_package_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn pkg() -> LockedPackage {
+        LockedPackage {
+            name: "pkg".to_string(),
+            version: "1.0.0".to_string(),
+            integrity: Some("sha512-abc".to_string()),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
+            dep_path: "pkg@1.0.0".to_string(),
+            local_source: None,
+            os: PlatformList::default(),
+            cpu: PlatformList::default(),
+            libc: PlatformList::default(),
+            bundled_dependencies: Vec::new(),
+            tarball_url: None,
+            registry_git_hosted: false,
+            alias_of: None,
+            yarn_checksum: None,
+            engines: BTreeMap::new(),
+            bin: BTreeMap::new(),
+            declared_dependencies: BTreeMap::new(),
+            license: None,
+            funding_url: None,
+            optional: false,
+            transitive_peer_dependencies: Vec::new(),
+            extra_meta: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn source_approval_key_ignores_registry_git_hosted_packages() {
+        let mut pkg = pkg();
+        pkg.registry_git_hosted = true;
+
+        assert_eq!(pkg.source_approval_key(), None);
+    }
+
+    #[test]
+    fn source_approval_key_strips_peer_suffix_for_local_sources() {
+        let mut pkg = pkg();
+        pkg.dep_path = "pkg@file+abc(peer@1.0.0)".to_string();
+        pkg.local_source = Some(LocalSource::Directory(PathBuf::from("vendor/pkg")));
+
+        assert_eq!(pkg.source_approval_key(), Some("pkg@file+abc"));
+    }
 }
 
 /// Metadata about a single declared peer dependency. Matches the shape of
