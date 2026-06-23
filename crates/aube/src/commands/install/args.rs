@@ -13,6 +13,10 @@ pub struct InstallArgs {
     /// Bypasses the `allowBuilds` allowlist. Do not use in CI.
     #[arg(long)]
     pub dangerously_allow_all_builds: bool,
+    /// Resolve and report what would happen without writing the lockfile
+    /// or linking node_modules.
+    #[arg(long, conflicts_with = "lockfile_only")]
+    pub dry_run: bool,
     /// Re-resolve lockfile entries whose spec drifted from package.json.
     ///
     /// Leaves everything else pinned at its locked version. Unchanged
@@ -272,6 +276,7 @@ impl InstallArgs {
             pnpmfile: self.pnpmfile,
             global_pnpmfile: self.global_pnpmfile,
             ignore_scripts: self.ignore_scripts,
+            dry_run: self.dry_run,
             lockfile_only: self.lockfile_only,
             merge_git_branch_lockfiles: self.merge_git_branch_lockfiles,
             dangerously_allow_all_builds: self.dangerously_allow_all_builds,
@@ -328,6 +333,10 @@ pub struct InstallOptions {
     /// `install`, `postinstall`, `prepare`) *and* every dependency's
     /// lifecycle scripts, regardless of `allowBuilds`.
     pub ignore_scripts: bool,
+    /// `--dry-run`: resolve dependencies and report the planned lockfile
+    /// shape without writing lockfiles, node_modules, install state, or
+    /// lifecycle outputs.
+    pub dry_run: bool,
     /// `--lockfile-only`: resolve and write the lockfile, but skip
     /// linking `node_modules` and running lifecycle scripts. Useful
     /// for CI workflows that only need to refresh the lockfile.
@@ -439,6 +448,7 @@ impl InstallOptions {
             pnpmfile: None,
             global_pnpmfile: None,
             ignore_scripts: false,
+            dry_run: false,
             lockfile_only: false,
             merge_git_branch_lockfiles: false,
             dangerously_allow_all_builds: false,
