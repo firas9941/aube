@@ -143,7 +143,7 @@ pub async fn run(
         inspect,
         inspect_brk,
         parallel,
-        no_bail: _,
+        no_bail,
         report_summary: _,
         reporter_hide_prefix,
         resume_from,
@@ -182,6 +182,7 @@ pub async fn run(
         resume_from,
         workspace_concurrency,
         reporter_hide_prefix,
+        no_bail,
     };
     run_script_with(
         &script, &args, &node_args, no_install, if_present, parallel, silent, &filter, recursive,
@@ -214,6 +215,10 @@ pub(crate) struct RecursiveOpts {
     /// a `<package>: ` prefix. Matches pnpm's `--reporter-hide-prefix`.
     /// Sequential runs ignore this — they always inherit stdio.
     pub reporter_hide_prefix: bool,
+    /// Continue sequential recursive runs after a script exits non-zero,
+    /// then return the first failing exit code after every matched package
+    /// has had a chance to run.
+    pub no_bail: bool,
 }
 
 impl Default for RecursiveOpts {
@@ -224,6 +229,7 @@ impl Default for RecursiveOpts {
             resume_from: None,
             workspace_concurrency: None,
             reporter_hide_prefix: false,
+            no_bail: false,
         }
     }
 }
@@ -504,6 +510,7 @@ async fn run_script_filtered(
         .await;
     }
 
+    let mut first_exit: Option<i32> = None;
     for pkg in &matched {
         let name = pkg
             .name
@@ -525,7 +532,10 @@ async fn run_script_filtered(
                 )
                 .await?
                 {
-                    return Ok(Some(code));
+                    if !recursive.no_bail {
+                        return Ok(Some(code));
+                    }
+                    first_exit.get_or_insert(code);
                 }
                 continue;
             }
@@ -550,10 +560,13 @@ async fn run_script_filtered(
         )
         .await?
         {
-            return Ok(Some(code));
+            if !recursive.no_bail {
+                return Ok(Some(code));
+            }
+            first_exit.get_or_insert(code);
         }
     }
-    Ok(None)
+    Ok(first_exit)
 }
 
 /// Apply topo sort, reverse, and resume-from to a matched-package list.
@@ -748,9 +761,9 @@ async fn run_filtered_parallel(
             // signaled `true` (= finished, regardless of outcome).
             // pnpm's default `--no-bail=false` aborts the whole run on
             // first failure anyway, so the "wait for failed dep too"
-            // case only fires under `--no-bail` (parsed but not yet
-            // wired) and degrades to "dependent runs against possibly
-            // stale dep state" — same as pnpm. A `changed()` Err means
+            // case only fires under `--no-bail` and degrades to
+            // "dependent runs against possibly stale dep state" — same
+            // as pnpm. A `changed()` Err means
             // the prereq's sender was dropped without sending (panic
             // or aborted JoinHandle); break so dependents unblock
             // instead of hanging — only reachable because each task
