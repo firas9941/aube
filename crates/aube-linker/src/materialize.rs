@@ -6,7 +6,50 @@ use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
 use aube_lockfile::{LockedPackage, shared_local_dep_path};
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+enum MaterializePlacement {
+    Placed,
+    LostRace,
+}
+
+fn materialize_tmp_name() -> String {
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    format!(".tmp-{}-{id}", std::process::id())
+}
+
+fn place_materialized_entry(src: &Path, dst: &Path) -> io::Result<MaterializePlacement> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut backoff_ms = 20u64;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return Ok(MaterializePlacement::Placed),
+            Err(_) if dst.exists() => return Ok(MaterializePlacement::LostRace),
+            Err(err) if is_transient_rename_error(&err) && attempt < MAX_ATTEMPTS - 1 => {
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = backoff_ms.saturating_mul(2);
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_transient_rename_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
 
 /// Test-only switch that forces the reflink attempt in
 /// [`Linker::link_file_fresh`] to be treated as failed, so the
@@ -202,14 +245,12 @@ impl Linker {
 
         // Materialize into a temp directory, then atomically rename into place
         // to avoid TOCTOU races between concurrent `aube install` processes.
-        // `subdir` already comes from `dep_path_to_filename`, which
-        // flattens `/` to `+` as part of its escape pass, so it's
-        // already safe to splice into a single path component.
-        let tmp_name = format!(".tmp-{}-{subdir}", std::process::id());
+        let tmp_name = materialize_tmp_name();
         let tmp_base = self.virtual_store.join(&tmp_name);
 
         let result = self.materialize_into(
             &tmp_base,
+            &self.virtual_store,
             dep_path,
             pkg,
             index,
@@ -228,17 +269,20 @@ impl Linker {
         let final_entry = self.virtual_store.join(subdir);
 
         // Ensure the parent of the final entry exists (e.g. for scoped packages).
-        if let Some(parent) = final_entry.parent() {
-            mkdirp(parent)?;
+        if let Some(parent) = final_entry.parent()
+            && let Err(e) = mkdirp(parent)
+        {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return Err(e);
         }
 
-        match aube_util::fs_atomic::rename_with_retry(&tmp_entry, &final_entry) {
-            Ok(()) => {
+        match place_materialized_entry(&tmp_entry, &final_entry) {
+            Ok(MaterializePlacement::Placed) => {
                 trace!("atomically placed {subdir} in virtual store");
             }
-            Err(e) if final_entry.exists() => {
+            Ok(MaterializePlacement::LostRace) => {
                 // Another process won the race — that's fine, use theirs.
-                trace!("lost rename race for {dep_path}, using existing: {e}");
+                trace!("lost rename race for {dep_path}, using existing");
                 // Undo the stats from our materialization since we're discarding it
                 stats.packages_linked = stats.packages_linked.saturating_sub(1);
                 stats.files_linked = stats.files_linked.saturating_sub(index.len());
@@ -333,10 +377,13 @@ impl Linker {
     /// virtual store at `aube_dir/<dep_path>/node_modules/<name>/`.
     ///
     /// Idempotent: if the entry already exists, counts as cached and
-    /// returns. Used by the install-time materializer to pipeline the
-    /// link work into the fetch phase under non-GVS mode, so the
-    /// dedicated link phase only has to create top-level
-    /// `node_modules/<name>` symlinks.
+    /// returns. Otherwise materializes into a unique temp directory
+    /// and atomically renames that entry into place so duplicate
+    /// in-process fetch events for the same dep-path cannot race while
+    /// writing `node_modules/.aube/<dep_path>/`. Used by the
+    /// install-time materializer to pipeline the link work into the
+    /// fetch phase under non-GVS mode, so the dedicated link phase only
+    /// has to create top-level `node_modules/<name>` symlinks.
     pub fn ensure_in_aube_dir(
         &self,
         aube_dir: &Path,
@@ -346,16 +393,17 @@ impl Linker {
         stats: &mut LinkStats,
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     ) -> Result<(), Error> {
-        // `materialize_into` batches `create_dir_all` for every parent
-        // it needs, so callers don't have to mkdirp the entry's parent
-        // (which is just `aube_dir` itself, already created by the
-        // materializer driver).
-        let entry = aube_dir.join(self.aube_dir_entry_name(dep_path));
-        if entry.exists() {
+        let subdir = self.aube_dir_entry_name(dep_path);
+        let final_entry = aube_dir.join(&subdir);
+        if final_entry.exists() {
             stats.packages_cached += 1;
             return Ok(());
         }
-        self.materialize_into(
+
+        let tmp_name = materialize_tmp_name();
+        let tmp_base = aube_dir.join(&tmp_name);
+        let result = self.materialize_into(
+            &tmp_base,
             aube_dir,
             dep_path,
             pkg,
@@ -363,10 +411,53 @@ impl Linker {
             stats,
             false,
             nested_link_targets,
-        )
+        );
+
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return result;
+        }
+
+        let tmp_entry = tmp_base.join(&subdir);
+        if let Some(parent) = final_entry.parent()
+            && let Err(e) = mkdirp(parent)
+        {
+            let _ = std::fs::remove_dir_all(&tmp_base);
+            return Err(e);
+        }
+
+        match place_materialized_entry(&tmp_entry, &final_entry) {
+            Ok(MaterializePlacement::Placed) => {}
+            Ok(MaterializePlacement::LostRace) => {
+                stats.packages_linked = stats.packages_linked.saturating_sub(1);
+                stats.files_linked = stats.files_linked.saturating_sub(index.len());
+                stats.packages_cached += 1;
+                let _ = std::fs::remove_dir_all(&tmp_base);
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_base);
+                return Err(Error::Io(final_entry, e));
+            }
+        }
+
+        if let Err(e) = std::fs::remove_dir(&tmp_base) {
+            debug!(
+                "remove_dir({}) failed, leaving tmp in place: {e}",
+                tmp_base.display()
+            );
+        }
+
+        Ok(())
     }
 
     /// Materialize a package's files and transitive dep symlinks into a base directory.
+    ///
+    /// `base_dir` is where files are written during materialization.
+    /// `final_base_dir` is where those files will live after any
+    /// wrapper rename. These differ for `.tmp-*` staging dirs; Windows
+    /// junctions need the final root because they persist absolute
+    /// targets at creation time.
     ///
     /// `apply_hashes` controls whether per-dep subdir names are run
     /// through `vstore_key` (the content-addressed name) or used as
@@ -379,6 +470,7 @@ impl Linker {
     pub(crate) fn materialize_into(
         &self,
         base_dir: &Path,
+        final_base_dir: &Path,
         dep_path: &str,
         pkg: &LockedPackage,
         index: &PackageIndex,
@@ -395,6 +487,9 @@ impl Linker {
         // this graph", which is the common case.
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
     ) -> Result<(), Error> {
+        #[cfg(not(windows))]
+        let _ = final_base_dir;
+
         validate_package_link_name(&pkg.name)?;
         for dep_name in pkg.dependencies.keys() {
             validate_package_link_name(dep_name)?;
@@ -592,27 +687,20 @@ impl Linker {
             let target = pathdiff::diff_paths(&sibling_abs, link_parent)
                 .unwrap_or_else(|| sibling_abs.clone());
 
-            // GVS materialize writes into `.tmp-<pid>-<subdir>/`, then
-            // atomic-renames into `self.virtual_store/<subdir>/`. POSIX
-            // symlinks store the relative offset verbatim. Offset stays
-            // invariant under the wrapper rename, so the link resolves
-            // correctly after the move. Windows junctions resolve the
-            // target against `link.parent()` at create time and persist
-            // an absolute path, which binds the junction to the tmp
-            // wrapper. After rename every sibling link dangles into a
-            // gone `.tmp-<pid>-...` path. Fix: on Windows GVS path
-            // (`apply_hashes = true`) rewrite the target to point at
-            // the final virtual store root so the stored absolute path
-            // survives the rename.
+            // Staged materialization writes into `.tmp-<pid>-<id>/`,
+            // then atomic-renames into `final_base_dir/<subdir>/`.
+            // POSIX symlinks store the relative offset verbatim.
+            // Offset stays invariant under the wrapper rename, so the
+            // link resolves correctly after the move. Windows junctions
+            // resolve the target against `link.parent()` at create time
+            // and persist an absolute path, which binds the junction to
+            // the tmp wrapper. Point Windows at the final root up front
+            // so the stored absolute path survives the rename.
             #[cfg(windows)]
-            let target = if apply_hashes {
-                self.virtual_store
-                    .join(&sibling_subdir)
-                    .join("node_modules")
-                    .join(dep_name)
-            } else {
-                target
-            };
+            let target = final_base_dir
+                .join(&sibling_subdir)
+                .join("node_modules")
+                .join(dep_name);
 
             sys::create_dir_link(&target, &symlink_path)
                 .map_err(|e| Error::Io(symlink_path.clone(), e))?;
