@@ -262,6 +262,11 @@ pub fn write(path: &Path, graph: &LockfileGraph, manifest: &PackageJson) -> Resu
         let is_jsr_registry_pkg = pkg.registry_name().starts_with("@jsr/");
         let preserve_tarball_url = graph.settings.lockfile_include_tarball_url
             || is_jsr_registry_pkg
+            || pkg
+                .extra_meta
+                .get(crate::EXTRA_PRESERVE_TARBALL_URL)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
             || registry_tarball_url_is_not_derivable(
                 pkg.registry_name(),
                 &pkg.version,
