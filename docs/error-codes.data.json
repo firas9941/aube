@@ -133,6 +133,12 @@
       "exit_code": 40
     },
     {
+      "name": "ERR_AUBE_ACCESS_ENTITY_NOT_FOUND",
+      "category": "Registry / network",
+      "description": "Registry returned 404 for an access user, organization, or team.",
+      "exit_code": null
+    },
+    {
       "name": "ERR_AUBE_VERSION_NOT_FOUND",
       "category": "Registry / network",
       "description": "Package exists but the requested version doesn't.",
@@ -328,6 +334,12 @@
       "name": "ERR_AUBE_CONFLICTING_BUILD_FLAGS",
       "category": "Engine / CLI",
       "description": "`aube add` was passed the same package name in both `--allow-build` and `--deny-build`.",
+      "exit_code": null
+    },
+    {
+      "name": "ERR_AUBE_ACCESS_INVALID_ARGUMENT",
+      "category": "Engine / CLI",
+      "description": "`aube access` received an invalid access setting, permission level, team, or package argument.",
       "exit_code": null
     },
     {

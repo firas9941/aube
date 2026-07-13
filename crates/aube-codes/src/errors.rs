@@ -35,6 +35,7 @@ pub const ERR_AUBE_PEER_CONTEXT_NOT_CONVERGED: &str = "ERR_AUBE_PEER_CONTEXT_NOT
 
 // ── registry / network ──────────────────────────────────────────────
 pub const ERR_AUBE_PACKAGE_NOT_FOUND: &str = "ERR_AUBE_PACKAGE_NOT_FOUND";
+pub const ERR_AUBE_ACCESS_ENTITY_NOT_FOUND: &str = "ERR_AUBE_ACCESS_ENTITY_NOT_FOUND";
 pub const ERR_AUBE_VERSION_NOT_FOUND: &str = "ERR_AUBE_VERSION_NOT_FOUND";
 pub const ERR_AUBE_UNAUTHORIZED: &str = "ERR_AUBE_UNAUTHORIZED";
 pub const ERR_AUBE_OFFLINE: &str = "ERR_AUBE_OFFLINE";
@@ -88,6 +89,7 @@ pub const ERR_AUBE_COMPLETION_FAILED: &str = "ERR_AUBE_COMPLETION_FAILED";
 pub const ERR_AUBE_REMOVE_PRIOR_INSTALL_DIR: &str = "ERR_AUBE_REMOVE_PRIOR_INSTALL_DIR";
 pub const ERR_AUBE_CONFIG_NESTED_AUBE_KEY: &str = "ERR_AUBE_CONFIG_NESTED_AUBE_KEY";
 pub const ERR_AUBE_CONFLICTING_BUILD_FLAGS: &str = "ERR_AUBE_CONFLICTING_BUILD_FLAGS";
+pub const ERR_AUBE_ACCESS_INVALID_ARGUMENT: &str = "ERR_AUBE_ACCESS_INVALID_ARGUMENT";
 pub const ERR_AUBE_SHIM_CREATE_FAILED: &str = "ERR_AUBE_SHIM_CREATE_FAILED";
 pub const ERR_AUBE_SHIM_EXEC_FAILED: &str = "ERR_AUBE_SHIM_EXEC_FAILED";
 
@@ -263,6 +265,12 @@ pub const ALL: &[CodeMeta] = &[
         category: category::REGISTRY_NETWORK,
         description: "Registry returned 404 for the package name.",
         exit_code: Some(40),
+    },
+    CodeMeta {
+        name: ERR_AUBE_ACCESS_ENTITY_NOT_FOUND,
+        category: category::REGISTRY_NETWORK,
+        description: "Registry returned 404 for an access user, organization, or team.",
+        exit_code: None,
     },
     CodeMeta {
         name: ERR_AUBE_VERSION_NOT_FOUND,
@@ -464,6 +472,12 @@ pub const ALL: &[CodeMeta] = &[
         name: ERR_AUBE_CONFLICTING_BUILD_FLAGS,
         category: category::ENGINE_CLI,
         description: "`aube add` was passed the same package name in both `--allow-build` and `--deny-build`.",
+        exit_code: None,
+    },
+    CodeMeta {
+        name: ERR_AUBE_ACCESS_INVALID_ARGUMENT,
+        category: category::ENGINE_CLI,
+        description: "`aube access` received an invalid access setting, permission level, team, or package argument.",
         exit_code: None,
     },
     CodeMeta {
