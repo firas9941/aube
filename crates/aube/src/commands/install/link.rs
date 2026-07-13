@@ -266,14 +266,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
         } else {
             let engine = node_version.map(aube_lockfile::graph_hash::engine_name_default);
             let allow = |pkg: &aube_lockfile::LockedPackage| {
-                matches!(
-                    build_policy.decide_package(
-                        pkg.registry_name(),
-                        &pkg.version,
-                        pkg.source_approval_key().as_deref(),
-                    ),
-                    aube_scripts::AllowDecision::Allow
-                )
+                super::package_build_is_allowed(build_policy, pkg)
             };
             aube_lockfile::graph_hash::compute_graph_hashes_full(
                 graph_for_link,
