@@ -46,8 +46,8 @@ pub async fn run(args: CiArgs) -> miette::Result<()> {
         network: _,
         virtual_store: _,
     } = args;
-    let cwd = crate::dirs::project_root()?;
-    let _lock = super::take_project_lock(&cwd)?;
+    let cwd = crate::dirs::workspace_or_project_root()?;
+    let lock = super::take_project_lock(&cwd)?;
 
     let nm = super::project_modules_dir(&cwd);
     // `symlink_metadata` instead of `exists` so we notice (and delete) a
@@ -94,5 +94,5 @@ pub async fn run(args: CiArgs) -> miette::Result<()> {
         // `advisoryCheckEveryInstall` setting still apply.
         osv_transitive_check: false,
     };
-    install::run(opts).await
+    install::run_with_project_lock(opts, &lock).await
 }
