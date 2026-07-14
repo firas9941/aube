@@ -78,6 +78,7 @@ pub(super) fn run_link_phase(input: LinkPhaseInput<'_>) -> miette::Result<LinkPh
     // diagnostic). Settings-file values flow through the generated typed
     // accessor, which collapses unknown values to `None` so they behave
     // like an absent setting.
+    super::control::check_cancelled()?;
     let strategy = resolve_link_strategy(cwd, settings_ctx, planned_gvs)?;
     if let Some(p) = prog_ref {
         p.set_phase("linking");

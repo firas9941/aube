@@ -993,23 +993,24 @@ pub(super) fn check_unmet_peers(
     if unmet.is_empty() {
         return Ok(());
     }
-    // Called from install flow after resolver, before linker phase.
-    // Progress bar is active at this point. Raw eprintln smears
-    // across bar frames. Route through safe_eprintln.
-    crate::progress::safe_eprintln("error: Issues with peer dependencies found");
+    super::control::output(
+        super::InstallOutputLevel::Error,
+        None,
+        "Issues with peer dependencies found",
+    );
     for u in &unmet {
         let from_ver = version_from_dep_path(&u.from_dep_path, &u.from_name);
         let msg = match &u.found {
             Some(found) => format!(
-                "error:   {}@{from_ver}: expected peer {}@{}, found {found}",
+                "  {}@{from_ver}: expected peer {}@{}, found {found}",
                 u.from_name, u.peer_name, u.declared,
             ),
             None => format!(
-                "error:   {}@{from_ver}: missing required peer {}@{}",
+                "  {}@{from_ver}: missing required peer {}@{}",
                 u.from_name, u.peer_name, u.declared,
             ),
         };
-        crate::progress::safe_eprintln(&msg);
+        super::control::output(super::InstallOutputLevel::Error, None, msg);
     }
     Err(miette!(
         "{} unmet peer dependenc{} (strict-peer-dependencies is enabled)\n  \

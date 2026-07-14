@@ -7,6 +7,7 @@ use std::io::Write;
 mod advisory;
 mod args;
 mod bin_linking;
+pub(crate) mod control;
 mod critical_path;
 mod delta;
 mod dep_selection;
@@ -34,6 +35,10 @@ mod workspace;
 use advisory::resolve_osv_routing_settings;
 pub use args::{InstallArgs, InstallOptions};
 pub(crate) use bin_linking::{PkgJsonCache, link_dep_bins, materialized_pkg_dir};
+pub use control::{
+    InstallControl, InstallEvent, InstallOutputLevel, InstallOutputMode, InstallPhase,
+    InstallProgressSnapshot, InstallReporter,
+};
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
 use fetch::{
@@ -513,14 +518,20 @@ pub(crate) async fn run_with_project_lock(
 }
 
 async fn run_scoped(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+    let control = opts.control.clone();
     // Box the large install state machine before stacking task-local scopes.
     // Keeping it inline overflowed a Tokio worker stack in the parallel-install
     // regression test once runtime and script-settings scopes were added.
     let install = Box::pin(run_inner(opts, cwd));
-    crate::runtime::scope(aube_scripts::scope(crate::dep_chain::scope(install))).await
+    control::scope(
+        control,
+        crate::runtime::scope(aube_scripts::scope(crate::dep_chain::scope(install))),
+    )
+    .await
 }
 
 async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Result<()> {
+    opts.control.check_cancelled()?;
     let mode = opts.mode;
     let start = std::time::Instant::now();
     let mut phase_timings = InstallPhaseTimings::from_env();
@@ -532,8 +543,10 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
         apply_force_state_reset(&cwd, &opts)?;
     }
     if !opts.dry_run
-        && try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd))
+        && let Some(total) =
+            try_install_fast_path(&cwd, &opts, mode, modules_cache_sweep_is_default(&cwd))?
     {
+        control::complete(total);
         return Ok(());
     }
 
@@ -737,6 +750,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
     // *no* output other than the bar itself — everything else is tracing at
     // debug level, visible with `aube -v install`. Must be constructed after
     // any lifecycle script that writes to stderr.
+    control::check_cancelled()?;
     let prog = InstallProgress::try_new();
     let prog_ref = prog.as_ref();
 
@@ -1026,6 +1040,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
             )?;
             validate_lockfile_trust_policy(&cwd, &graph, opts.network_mode, &dependency_policy)
                 .await?;
+            control::check_cancelled()?;
             let source_label = resolve::lockfile_source_label(kind);
             tracing::debug!(
                 "{source_label}: {} packages for {project_name}",
@@ -1039,6 +1054,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
 
             // Lockfile path: the total is known upfront, so seed the overall
             // bar with the full package count and enter the fetch phase.
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 p.set_total(graph.packages.len());
                 p.set_phase("fetching");
@@ -1160,6 +1176,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
         {
             // No lockfile — resolve + fetch tarballs concurrently
             tracing::debug!("No lockfile found, resolving dependencies for {project_name}...");
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 // Seed the resolving-phase denominator floor from any
                 // existing lockfile on disk. In FrozenMode::Fix /
@@ -1247,6 +1264,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
             };
             super::run_pnpmfile_pre_resolution(&pnpmfile_paths, &cwd, existing_for_resolver)
                 .await?;
+            control::check_cancelled()?;
             let (read_package_host, read_package_forwarders) =
                 match crate::pnpmfile::ReadPackageHostChain::spawn(&pnpmfile_paths, &cwd)
                     .await
@@ -1836,6 +1854,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
                 osv_settings.advisory_check_every_install,
             )
             .await?;
+            control::check_cancelled()?;
 
             // Bun-compatible security scanner runs against the
             // *resolved* graph — full transitive set with concrete
@@ -1852,6 +1871,7 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
                 super::security_scanner::run_scanner(&scanner, &cwd, &scanner_packages).await?;
             }
 
+            control::check_cancelled()?;
             if let Some(p) = prog_ref {
                 p.set_phase("fetching");
             }
@@ -2341,10 +2361,10 @@ async fn run_inner(opts: InstallOptions, cwd: std::path::PathBuf) -> miette::Res
     // output across bar frames. Route through safe_eprintln which
     // pauses the bar and holds the terminal lock for atomic output.
     for w in &policy_warnings {
-        crate::progress::safe_eprintln(&format!("warn: {w}"));
+        control::output(InstallOutputLevel::Warning, None, w.to_string());
     }
     for w in &jail_policy_warnings {
-        crate::progress::safe_eprintln(&format!("warn: {w}"));
+        control::output(InstallOutputLevel::Warning, None, w.to_string());
     }
 
     let link::LinkPhaseOutput {
