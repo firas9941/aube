@@ -35,6 +35,9 @@ pub(crate) use tarball::normalize_tar_entry_path;
 pub(crate) use tarball::{
     CappedReader, MAX_TARBALL_DECOMPRESSED_BYTES, MAX_TARBALL_ENTRIES, MAX_TARBALL_ENTRY_BYTES,
 };
+pub use tarball::{
+    directory_content_fingerprint, directory_fingerprints, directory_metadata_fingerprint,
+};
 
 #[cfg(test)]
 use sha1::Sha1;
