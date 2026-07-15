@@ -13,6 +13,7 @@ pub(super) struct AddManifestOptions {
     pub(super) save_exact: bool,
     pub(super) save_optional: bool,
     pub(super) save_peer: bool,
+    pub(super) network_mode: aube_registry::NetworkMode,
     /// Target catalog for `--save-catalog` / `--save-catalog-name`.
     /// `None` means neither flag was passed and the catalog yaml is
     /// left untouched. `Some("default")` is `--save-catalog`;
@@ -34,6 +35,7 @@ impl AddManifestOptions {
             save_exact: args.save_exact,
             save_optional: args.save_optional,
             save_peer: args.save_peer,
+            network_mode: aube_registry::NetworkMode::Online,
             save_catalog: args.save_catalog_name.clone().or_else(|| {
                 if args.save_catalog {
                     Some("default".to_string())
@@ -136,7 +138,8 @@ pub(super) async fn update_manifest_for_add(
     let mut catalog_upserts: Vec<CatalogUpsert> = Vec::new();
 
     // Parse all specs and fetch packuments concurrently.
-    let client = std::sync::Arc::new(crate::commands::make_client(cwd));
+    let client =
+        std::sync::Arc::new(crate::commands::make_client(cwd).with_network_mode(opts.network_mode));
     let mut parsed: Vec<_> = packages
         .iter()
         .map(|s| {
@@ -222,7 +225,8 @@ pub(super) async fn update_manifest_for_add(
     // also bypass the registry — the workspace is the source of
     // truth for those names. Without these guards the parallel
     // fetch below would 404 on the non-registry name.
-    let mut handles = Vec::new();
+    let mut handles = tokio::task::JoinSet::new();
+    let packument_cache_dir = crate::commands::packument_cache_dir_for_cwd(cwd);
     for spec in &parsed {
         if aube_util::pkg::is_workspace_spec(&spec.range)
             || spec.git_spec.is_some()
@@ -232,20 +236,20 @@ pub(super) async fn update_manifest_for_add(
             continue;
         }
         let client = client.clone();
+        let cache_dir = packument_cache_dir.clone();
         let name = spec.name.clone();
-        let handle = tokio::spawn(async move {
+        handles.spawn(async move {
             let packument = client
-                .fetch_packument(&name)
+                .fetch_packument_cached(&name, &cache_dir)
                 .await
                 .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
             Ok::<_, miette::Report>((name, packument))
         });
-        handles.push(handle);
     }
 
     let mut packuments = BTreeMap::new();
-    for handle in handles {
-        let (name, packument) = handle.await.into_diagnostic()??;
+    while let Some(handle) = handles.join_next().await {
+        let (name, packument) = handle.into_diagnostic()??;
         packuments.insert(name, packument);
     }
 
@@ -316,7 +320,11 @@ pub(super) async fn update_manifest_for_add(
             .get(&spec.name)
             .expect("packument missing for non-skipped registry spec");
 
-        eprintln!("Resolving {}@{}...", spec.name, spec.range);
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            format!("Resolving {}@{}...", spec.name, spec.range),
+        );
 
         // Resolve "latest" and other dist-tags to a version range.
         let effective_range = if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
@@ -490,7 +498,11 @@ pub(super) async fn update_manifest_for_add(
             }
         };
 
-        eprintln!("  + {pkg_name_for_manifest}@{display_version} (specifier: {specifier})");
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            format!("  + {pkg_name_for_manifest}@{display_version} (specifier: {specifier})"),
+        );
 
         // Remove from all dep sections first to avoid duplicates across
         // sections. `--save-peer` intentionally does NOT clear the peer
@@ -533,7 +545,11 @@ pub(super) async fn update_manifest_for_add(
     // restore the original bytes from their snapshot before returning.
     crate::commands::write_manifest_dep_sections(&manifest_path, &manifest)?;
     if print_updated {
-        eprintln!("Updated package.json");
+        crate::commands::install::control::output(
+            crate::commands::install::InstallOutputLevel::Info,
+            None,
+            "Updated package.json",
+        );
     }
 
     // Apply queued `--save-catalog` upserts. Lands once at the end of
@@ -603,9 +619,13 @@ fn apply_workspace_spec_to_manifest(
         ));
     };
 
-    eprintln!(
-        "  + {pkg_name_for_manifest}@{workspace_version} (specifier: {})",
-        spec.range
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!(
+            "  + {pkg_name_for_manifest}@{workspace_version} (specifier: {})",
+            spec.range
+        ),
     );
 
     // Mirror the duplicate-section scrub the registry path does.
@@ -721,7 +741,11 @@ fn apply_linked_workspace_to_manifest(
         }
     };
 
-    eprintln!("  + {pkg_name_for_manifest}@{workspace_version} (specifier: {specifier})");
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!("  + {pkg_name_for_manifest}@{workspace_version} (specifier: {specifier})"),
+    );
 
     manifest.dependencies.remove(pkg_name_for_manifest);
     manifest.optional_dependencies.remove(pkg_name_for_manifest);
@@ -771,7 +795,11 @@ fn apply_git_spec_to_manifest(
     verbatim_spec: &str,
     opts: &AddManifestOptions,
 ) {
-    eprintln!("  + {pkg_name_for_manifest} (specifier: {verbatim_spec})");
+    crate::commands::install::control::output(
+        crate::commands::install::InstallOutputLevel::Info,
+        None,
+        format!("  + {pkg_name_for_manifest} (specifier: {verbatim_spec})"),
+    );
 
     manifest.dependencies.remove(pkg_name_for_manifest);
     manifest.optional_dependencies.remove(pkg_name_for_manifest);
@@ -897,4 +925,62 @@ fn decide_save_catalog(
         range: manual_specifier.to_string(),
     });
     (manifest_specifier, resolved_version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn offline_add_resolves_from_packument_cache() {
+        let project = tempfile::tempdir().unwrap();
+        let cache_root = project.path().join("cache");
+        std::fs::write(project.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!("cache-dir={}\n", cache_root.display()),
+        )
+        .unwrap();
+
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": "cached-only",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "cached-only",
+                    "version": "1.0.0"
+                }
+            }
+        }))
+        .unwrap();
+        let cache_dir = crate::commands::packument_cache_dir_for_cwd(project.path());
+        crate::commands::make_client(project.path()).seed_packument_cache(
+            "cached-only",
+            &cache_dir,
+            &packument,
+            None,
+            None,
+            true,
+        );
+
+        update_manifest_for_add(
+            project.path(),
+            &["cached-only".to_string()],
+            AddManifestOptions {
+                save_dev: false,
+                save_exact: false,
+                save_optional: false,
+                save_peer: false,
+                network_mode: aube_registry::NetworkMode::Offline,
+                save_catalog: None,
+                workspace_protocol_override: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+        assert!(manifest.contains(r#""cached-only": "^1.0.0""#));
+    }
 }
