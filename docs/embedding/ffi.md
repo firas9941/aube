@@ -132,6 +132,48 @@ type InstallEvent =
 
 Codes follow the published [error-code stability policy](/error-codes).
 
+## Polled events
+
+Hosts that cannot receive callbacks on foreign threads (Bun FFI, some ctypes
+setups) can poll instead. Start the operation with `bufferEvents: true` and
+drain the queue from any host thread:
+
+```ts
+const handle = library.symbols.aube_install(
+  ptr(c(JSON.stringify({ projectDir: ".", bufferEvents: true }))),
+  null,
+  null,
+)
+let terminal = false
+while (!terminal) {
+  for (;;) {
+    const raw = library.symbols.aube_events_next(handle)
+    if (!raw) break
+    const event = JSON.parse(new CString(raw).toString())
+    library.symbols.aube_string_free(raw)
+    console.log(event)
+    terminal ||=
+      (event.kind === "phase" && event.phase === "complete") ||
+      (event.kind === "output" && event.level === "error")
+  }
+  if (!terminal) await new Promise((resolve) => setTimeout(resolve, 50))
+}
+// The terminal event arrived, so aube_wait returns immediately and
+// releases the handle.
+const result = library.symbols.aube_wait(handle)
+```
+
+The terminal event is the `complete` phase on success or the `error` output a
+failed operation emits last.
+
+`aube_events_next` returns the next buffered event as JSON (same schema as the
+callback transport), or null when no event is pending or the handle is unknown
+or already consumed. Each returned string must be freed with
+`aube_string_free`. The buffer holds 4096 events and drops the oldest when
+full; events still buffered when `aube_wait` returns are discarded with the
+handle, so drain before waiting (or poll from a different thread than the one
+that waits).
+
 ## Bun FFI
 
 ```ts
@@ -142,6 +184,7 @@ const library = dlopen(libraryPath, {
   aube_init: { args: ["ptr"], returns: "i32" },
   aube_install: { args: ["ptr", "ptr", "ptr"], returns: "u64" },
   aube_wait: { args: ["u64"], returns: "ptr" },
+  aube_events_next: { args: ["u64"], returns: "ptr" },
   aube_cancel: { args: ["u64"], returns: "i32" },
   aube_string_free: { args: ["ptr"], returns: "void" },
 })
@@ -160,8 +203,9 @@ library.symbols.aube_string_free(resultPointer)
 library.close()
 ```
 
-Bun's FFI and arbitrary-thread JavaScript callbacks remain experimental. Use
-the Node-API package when a JavaScript event callback is required in Bun.
+Bun's FFI and arbitrary-thread JavaScript callbacks remain experimental. In
+Bun, poll with `bufferEvents`/`aube_events_next` (above) instead of passing a
+callback, or use the Node-API package.
 
 ## Deno FFI
 
