@@ -89,7 +89,7 @@ pub(super) async fn update_manifest_for_add(
     // own dir so a sub-project's `.npmrc` still wins — switching the
     // entire context to the workspace root would silently drop those
     // overrides, since `load_npmrc_entries` doesn't walk up.
-    let (default_tag, default_prefix, catalog_mode) =
+    let (default_tag, default_prefix, catalog_mode, minimum_release_age, registry_supports_time) =
         crate::commands::with_settings_ctx(cwd, |ctx| {
             let tag = aube_settings::resolved::tag(ctx);
             let prefix = if opts.save_exact {
@@ -109,7 +109,22 @@ pub(super) async fn update_manifest_for_add(
                 }
             };
             let catalog_mode = aube_settings::resolved::catalog_mode(ctx);
-            (tag, prefix, catalog_mode)
+            // The version this function writes into the manifest must
+            // honor `minimumReleaseAge` the same way full resolution
+            // does: dist-tag adds and `--save-exact` pin a concrete
+            // version here, and a pinned fresh version would sail past
+            // the resolver's gate via its lenient exact-range fallback.
+            let minimum_release_age =
+                crate::commands::install::resolve_minimum_release_age(ctx, None);
+            let registry_supports_time_field =
+                aube_settings::resolved::registry_supports_time_field(ctx);
+            (
+                tag,
+                prefix,
+                catalog_mode,
+                minimum_release_age,
+                registry_supports_time_field,
+            )
         });
     let workspace_settings_cwd = crate::dirs::find_workspace_yaml_root(cwd)
         .or_else(|| crate::dirs::find_workspace_root(cwd))
@@ -226,7 +241,15 @@ pub(super) async fn update_manifest_for_add(
     // truth for those names. Without these guards the parallel
     // fetch below would 404 on the non-registry name.
     let mut handles = tokio::task::JoinSet::new();
-    let packument_cache_dir = crate::commands::packument_cache_dir_for_cwd(cwd);
+    // The age gate compares against the packument `time` map, which the
+    // abbreviated (corgi) payload omits — fetch full packuments when the
+    // gate is active. Same needs_time split the resolver makes.
+    // `registrySupportsTimeField` keeps the cheaper abbreviated path hot
+    // when the registry inlines `time` in corgi payloads.
+    let needs_time = minimum_release_age.is_some() && !registry_supports_time;
+    let corgi_cache_dir = crate::commands::packument_cache_dir_for_cwd(cwd);
+    let full_cache_dir = crate::commands::packument_full_cache_dir_for_cwd(cwd);
+    let offline = opts.network_mode == aube_registry::NetworkMode::Offline;
     for spec in &parsed {
         if aube_util::pkg::is_workspace_spec(&spec.range)
             || spec.git_spec.is_some()
@@ -236,13 +259,41 @@ pub(super) async fn update_manifest_for_add(
             continue;
         }
         let client = client.clone();
-        let cache_dir = packument_cache_dir.clone();
+        let corgi_dir = corgi_cache_dir.clone();
+        let full_dir = full_cache_dir.clone();
         let name = spec.name.clone();
         handles.spawn(async move {
-            let packument = client
-                .fetch_packument_cached(&name, &cache_dir)
-                .await
-                .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
+            let primary = if needs_time {
+                client
+                    .fetch_packument_with_time_cached(&name, &full_dir)
+                    .await
+            } else {
+                client.fetch_packument_cached(&name, &corgi_dir).await
+            };
+            // Offline adds serve whichever cache format holds the
+            // packument: the needs_time split writes online fetches to
+            // one cache only, so an add cached online under the gate
+            // lives in `packuments-full-v1` while an ungated one lives
+            // in the corgi cache — an offline retry must not fail on a
+            // package that's on disk in the other format. The full
+            // payload is a superset of corgi, and corgi's missing
+            // `time` map keeps its versions cutoff-eligible in
+            // `pick_version`, so either format picks correctly.
+            let packument = match primary {
+                Ok(packument) => Ok(packument),
+                Err(primary_err) if offline => {
+                    let fallback = if needs_time {
+                        client.fetch_packument_cached(&name, &corgi_dir).await
+                    } else {
+                        client
+                            .fetch_packument_with_time_cached(&name, &full_dir)
+                            .await
+                    };
+                    fallback.map_err(|_| primary_err)
+                }
+                Err(primary_err) => Err(primary_err),
+            }
+            .map_err(|e| miette!("failed to fetch {name}: {e}"))?;
             Ok::<_, miette::Report>((name, packument))
         });
     }
@@ -326,51 +377,71 @@ pub(super) async fn update_manifest_for_add(
             format!("Resolving {}@{}...", spec.name, spec.range),
         );
 
-        // Resolve "latest" and other dist-tags to a version range.
-        let effective_range = if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
+        // Resolve non-`latest` dist-tags to their tagged version: like
+        // exact pins, they're a deliberate user override (strict mode
+        // still refuses a gated one below). `latest` passes through
+        // verbatim — `pick_version_for_add` normalizes it at the API
+        // boundary, steering a gated `latest` to the newest version
+        // clearing the minimumReleaseAge cutoff while keeping the plain
+        // dist-tag preference for a mature one.
+        let effective_range = if spec.range == "latest" {
+            spec.range.clone()
+        } else if let Some(tagged_version) = packument.dist_tags.get(&spec.range) {
             tagged_version.clone()
         } else {
             spec.range.clone()
         };
 
-        // Find highest matching version. Reused below when a
-        // `catalogMode` rewrite redirects resolution to the catalog's
-        // range — the display version should match what will actually
-        // get installed, not what the user's original range resolved
-        // to, so we call this twice when the rewrite fires.
-        //
-        // Parse every candidate version once (skipping invalid ones
-        // entirely) and sort the parsed pairs. Comparator-only parsing
-        // burned ~2N parses per add; pre-parse turns it into N + log N
-        // and lets the satisfies-scan reuse the parsed `Version`.
-        let mut parsed_versions: Vec<(&String, node_semver::Version)> = packument
-            .versions
-            .keys()
-            .filter_map(|v| node_semver::Version::parse(v).ok().map(|p| (v, p)))
-            .collect();
-        parsed_versions.sort_by(|a, b| b.1.cmp(&a.1));
+        // Version pick, shared with the `catalogMode` rewrite below — the
+        // display version must match what will actually get installed, so
+        // the same pick runs when the rewrite redirects resolution to the
+        // catalog's range. Delegates to the resolver's `pick_version` so
+        // `add` and full resolution cannot drift: dist-tag preference,
+        // `minimumReleaseAgeExclude` exemptions, and the strict/lenient
+        // age-gate fallback all behave identically.
         let highest_satisfying = |range_str: &str| -> Option<String> {
-            let range = node_semver::Range::parse(range_str).ok()?;
-            // Mirror `aube_resolver::pick_version`: prefer the
-            // `dist-tags.latest` version when it satisfies the range.
-            // npm and pnpm both pin toward the publisher's tagged
-            // build over the strictly-highest matching version, and
-            // the display line here must agree with what the
-            // resolver actually installs.
-            if let Some(latest) = packument.dist_tags.get("latest")
-                && let Ok(parsed_latest) = node_semver::Version::parse(latest)
-                && parsed_latest.satisfies(&range)
-                && packument.versions.contains_key(latest)
-            {
-                return Some(latest.clone());
+            match aube_resolver::pick_version_for_add(
+                packument,
+                &spec.name,
+                range_str,
+                minimum_release_age.as_ref(),
+            ) {
+                aube_resolver::PickResult::Found(meta) => Some(meta.version.clone()),
+                aube_resolver::PickResult::NoMatch | aube_resolver::PickResult::AgeGated => None,
             }
-            parsed_versions
-                .iter()
-                .find(|(_, parsed)| parsed.satisfies(&range))
-                .map(|(raw, _)| (*raw).clone())
         };
-        let resolved_version = highest_satisfying(&effective_range)
-            .ok_or_else(|| miette!("no version of {} matches {effective_range}", spec.name))?;
+        let resolved_version = match aube_resolver::pick_version_for_add(
+            packument,
+            &spec.name,
+            &effective_range,
+            minimum_release_age.as_ref(),
+        ) {
+            aube_resolver::PickResult::Found(meta) => meta.version.clone(),
+            aube_resolver::PickResult::AgeGated => {
+                // Only reachable in strict mode today (the lenient pick
+                // falls back instead), but derive the label anyway so a
+                // future lenient AgeGated path can't print a lie.
+                let (minutes, strict) = minimum_release_age
+                    .as_ref()
+                    .map_or((0, false), |m| (m.minutes, m.strict));
+                return Err(miette!(
+                    code = aube_codes::errors::ERR_AUBE_NO_MATURE_MATCHING_VERSION,
+                    "no version of {} matching {effective_range} is older than {minutes} minute(s){}",
+                    spec.name,
+                    if strict {
+                        " (minimumReleaseAgeStrict=true)"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+            aube_resolver::PickResult::NoMatch => {
+                return Err(miette!(
+                    "no version of {} matches {effective_range}",
+                    spec.name
+                ));
+            }
+        };
 
         // Build the specifier for package.json.
         // Dist-tags (including "latest") are written as ^version — this matches pnpm's behavior
@@ -476,8 +547,11 @@ pub(super) async fn update_manifest_for_add(
                         .unwrap_or_default();
                     let catalog_version = highest_satisfying(&cat_range).unwrap_or_else(|| {
                         tracing::debug!(
-                            "catalog range {cat_range:?} for {} did not match any packument version; \
-                             falling back to user-resolved version for display",
+                            "catalog range {cat_range:?} for {} matched no packument version \
+                             (or, under minimumReleaseAgeStrict, none mature enough); falling \
+                             back to user-resolved version for display — the install that \
+                             follows resolves the catalog range itself and fails loudly if it \
+                             genuinely can't",
                             spec.name
                         );
                         resolved_version.clone()
@@ -898,8 +972,10 @@ fn decide_save_catalog(
             // for the same reason `decide_add_rewrite` does.
             let catalog_version = highest_satisfying(existing_range).unwrap_or_else(|| {
                 tracing::debug!(
-                    "catalog range {existing_range:?} for {} did not match any \
-                     packument version; falling back to user-resolved version for display",
+                    "catalog range {existing_range:?} for {} matched no packument version \
+                     (or, under minimumReleaseAgeStrict, none mature enough); falling back \
+                     to user-resolved version for display — the install that follows \
+                     resolves the catalog range itself and fails loudly if it genuinely can't",
                     spec.name
                 );
                 resolved_version.to_string()
@@ -982,5 +1058,63 @@ mod tests {
 
         let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
         assert!(manifest.contains(r#""cached-only": "^1.0.0""#));
+    }
+
+    #[tokio::test]
+    async fn offline_add_falls_back_to_full_packument_cache() {
+        // Online adds under the age gate cache packuments in
+        // `packuments-full-v1` only. If the gate is later disabled, the
+        // primary offline lookup moves to the corgi cache — but the add
+        // must still serve the full packument already on disk instead of
+        // failing on the empty corgi cache.
+        let project = tempfile::tempdir().unwrap();
+        let cache_root = project.path().join("cache");
+        std::fs::write(project.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            project.path().join(".npmrc"),
+            format!("cache-dir={}\nminimumReleaseAge=0\n", cache_root.display()),
+        )
+        .unwrap();
+
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": "full-cached-only",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "full-cached-only",
+                    "version": "1.0.0"
+                }
+            }
+        }))
+        .unwrap();
+        let full_cache_dir = crate::commands::packument_full_cache_dir_for_cwd(project.path());
+        crate::commands::make_client(project.path()).seed_full_packument_cache(
+            "full-cached-only",
+            &full_cache_dir,
+            &packument,
+            None,
+            None,
+            true,
+        );
+
+        update_manifest_for_add(
+            project.path(),
+            &["full-cached-only".to_string()],
+            AddManifestOptions {
+                save_dev: false,
+                save_exact: false,
+                save_optional: false,
+                save_peer: false,
+                network_mode: aube_registry::NetworkMode::Offline,
+                save_catalog: None,
+                workspace_protocol_override: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let manifest = std::fs::read_to_string(project.path().join("package.json")).unwrap();
+        assert!(manifest.contains(r#""full-cached-only": "^1.0.0""#));
     }
 }
