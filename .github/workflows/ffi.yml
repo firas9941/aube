@@ -1,12 +1,10 @@
-name: node-addon
+name: ffi
 
 on:
   pull_request:
     paths:
-      - "crates/aube-node/**"
+      - "crates/aube-ffi/**"
       - "crates/aube-codes/**"
-      - "crates/aube-registry/src/config/**"
-      - "crates/aube-registry/src/lib.rs"
       - "crates/aube/src/lib.rs"
       - "crates/aube/src/embed.rs"
       - "crates/aube/src/commands/add/mod.rs"
@@ -15,14 +13,12 @@ on:
       - "crates/aube/src/commands/install/frozen.rs"
       - "crates/aube-util/src/identity.rs"
       - "crates/aube-util/src/lib.rs"
-      - ".github/workflows/node-addon.yml"
+      - ".github/workflows/ffi.yml"
   push:
     branches: [main]
     paths:
-      - "crates/aube-node/**"
+      - "crates/aube-ffi/**"
       - "crates/aube-codes/**"
-      - "crates/aube-registry/src/config/**"
-      - "crates/aube-registry/src/lib.rs"
       - "crates/aube/src/lib.rs"
       - "crates/aube/src/embed.rs"
       - "crates/aube/src/commands/add/mod.rs"
@@ -31,13 +27,13 @@ on:
       - "crates/aube/src/commands/install/frozen.rs"
       - "crates/aube-util/src/identity.rs"
       - "crates/aube-util/src/lib.rs"
-      - ".github/workflows/node-addon.yml"
+      - ".github/workflows/ffi.yml"
   release:
     types: [published]
   workflow_dispatch:
 
 concurrency:
-  group: node-addon-${{ github.ref }}
+  group: ffi-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 permissions: {}
@@ -49,14 +45,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15, target: aarch64-apple-darwin, os: darwin, cpu: arm64, package: darwin-arm64, binary: libaube_node.dylib, smoke: true }
-          - { runner: macos-15-intel, target: x86_64-apple-darwin, os: darwin, cpu: x64, package: darwin-x64, binary: libaube_node.dylib, smoke: true }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os: linux, cpu: arm64, package: linux-arm64, binary: libaube_node.so, smoke: true }
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, os: linux, cpu: x64, package: linux-x64, binary: libaube_node.so, smoke: true }
-          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, os: linux, cpu: arm64, libc: musl, package: linux-arm64-musl, binary: libaube_node.so }
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, os: linux, cpu: x64, libc: musl, package: linux-x64-musl, binary: libaube_node.so }
-          - { runner: windows-latest, target: aarch64-pc-windows-msvc, os: win32, cpu: arm64, package: win32-arm64, binary: aube_node.dll }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc, os: win32, cpu: x64, package: win32-x64, binary: aube_node.dll, smoke: true }
+          - { runner: macos-15, target: aarch64-apple-darwin, os: darwin, cpu: arm64, package: darwin-arm64, binary: libaube_ffi.dylib, ext: dylib }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, os: darwin, cpu: x64, package: darwin-x64, binary: libaube_ffi.dylib, ext: dylib }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os: linux, cpu: arm64, package: linux-arm64, binary: libaube_ffi.so, ext: so }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, os: linux, cpu: x64, package: linux-x64, binary: libaube_ffi.so, ext: so }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, os: linux, cpu: arm64, libc: musl, package: linux-arm64-musl, binary: libaube_ffi.so, ext: so }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, os: linux, cpu: x64, libc: musl, package: linux-x64-musl, binary: libaube_ffi.so, ext: so }
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc, os: win32, cpu: arm64, package: win32-arm64, binary: aube_ffi.dll, ext: dll }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, os: win32, cpu: x64, package: win32-x64, binary: aube_ffi.dll, ext: dll }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions: { contents: read }
@@ -67,7 +63,7 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 # zizmor: ignore[cache-poisoning] PRs are read-only
         with:
-          shared-key: node-addon-${{ matrix.target }}
+          shared-key: ffi-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Rust target
         shell: bash
@@ -75,26 +71,26 @@ jobs:
       - name: Install musl compiler
         if: matrix.libc == 'musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Build addon
+      - name: Build C ABI library
         shell: bash
         run: |
           if [[ '${{ matrix.libc }}' == musl ]]; then
             export RUSTFLAGS='-C target-feature=-crt-static'
           fi
-          cargo build --locked --profile napi -p aube-node --target '${{ matrix.target }}'
+          cargo build --locked --profile ffi -p aube-ffi --target '${{ matrix.target }}'
       - name: Import macOS signing certificate
         if: github.event_name == 'release' && matrix.os == 'darwin'
         uses: apple-actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
         with:
           p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
           p12-password: ${{ secrets.CERTIFICATES_P12_PASS }}
-      - name: Sign macOS addon
+      - name: Sign macOS library
         if: github.event_name == 'release' && matrix.os == 'darwin'
         shell: bash
         run: |
           codesign --force --sign 'Developer ID Application: Jeffrey Dickey (4993Y37DX6)' \
             --options runtime --timestamp \
-            'target/${{ matrix.target }}/napi/${{ matrix.binary }}'
+            'target/${{ matrix.target }}/ffi/${{ matrix.binary }}'
       - name: Set package version
         id: version
         shell: bash
@@ -104,28 +100,24 @@ jobs:
         run: |
           if [[ "$EVENT_NAME" == release ]]; then version=${RELEASE_TAG#v}; else version="0.0.0-smoke.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"; fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Pack platform package
+      - name: Stage library and platform package
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          OUT_DIR: ${{ runner.temp }}/packages
-          AUBE_NODE_BINARY: target/${{ matrix.target }}/napi/${{ matrix.binary }}
-          AUBE_NODE_OS: ${{ matrix.os }}
-          AUBE_NODE_CPU: ${{ matrix.cpu }}
-          AUBE_NODE_LIBC: ${{ matrix.libc }}
-        run: node crates/aube-node/npm/package.mjs
-      - name: Smoke-load native addon
-        if: matrix.smoke
-        shell: bash
-        env:
-          SMOKE_ADDON: ${{ runner.temp }}/aube.node
+          OUT_DIR: ${{ runner.temp }}/ffi
+          AUBE_FFI_BINARY: target/${{ matrix.target }}/ffi/${{ matrix.binary }}
+          AUBE_FFI_OS: ${{ matrix.os }}
+          AUBE_FFI_CPU: ${{ matrix.cpu }}
+          AUBE_FFI_LIBC: ${{ matrix.libc }}
+          AUBE_FFI_TARGET: ${{ matrix.target }}
         run: |
-          cp 'target/${{ matrix.target }}/napi/${{ matrix.binary }}' "$SMOKE_ADDON"
-          node -e "require(process.env.SMOKE_ADDON)"
+          mkdir -p "$OUT_DIR"
+          cp "$AUBE_FFI_BINARY" "$OUT_DIR/libaube-${AUBE_FFI_TARGET}.${{ matrix.ext }}"
+          node crates/aube-ffi/npm/package.mjs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: aube-node-${{ matrix.package }}
-          path: ${{ runner.temp }}/packages/*.tgz
+          name: aube-ffi-${{ matrix.package }}
+          path: ${{ runner.temp }}/ffi/*
           if-no-files-found: error
 
   packages:
@@ -139,49 +131,56 @@ jobs:
         with: { node-version: "24", package-manager-cache: false }
       - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
-          tool_versions: bun 1.3.11
-          install_args: bun
+          tool_versions: |
+            bun 1.3.11
+            deno 2.9.2
+          install_args: bun deno
           cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with: { pattern: aube-node-*, path: packages, merge-multiple: true }
-      - name: Pack root package
+        with: { pattern: aube-ffi-*, path: packages, merge-multiple: true }
+      - name: Pack root npm package
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           if [[ "$EVENT_NAME" == release ]]; then VERSION=${RELEASE_TAG#v}; else VERSION="0.0.0-smoke.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"; fi
-          VERSION="$VERSION" OUT_DIR="$PWD/packages" node crates/aube-node/npm/package.mjs
+          VERSION="$VERSION" OUT_DIR="$PWD/packages" node crates/aube-ffi/npm/package.mjs
+          cp crates/aube-ffi/include/aube.h packages/aube.h
           test "$(find packages -maxdepth 1 -name '*.tgz' -print | wc -l)" -eq 9
-      - name: Smoke-test installed packages with Node and Bun
+      - name: Smoke-test raw library with Bun and Deno
         shell: bash
-        run: | # zizmor: ignore[adhoc-packages] installs only tarballs built by the required matrix jobs
+        env:
+          AUBE_FFI_LIBRARY: ${{ github.workspace }}/packages/libaube-x86_64-unknown-linux-gnu.so
+        run: |
+          bun run crates/aube-ffi/poc/bun.ts
+          deno run --allow-env=AUBE_FFI_LIBRARY --allow-ffi --allow-read --allow-write crates/aube-ffi/poc/deno.ts
+      - name: Smoke-test npm packages and declarations
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages] installs only tarballs built by required matrix jobs
           mkdir npm-smoke
           cd npm-smoke
           npm init --yes >/dev/null
           npm install --force --ignore-scripts --no-package-lock ../packages/*.tgz
-          node -e "require('@jdxcode/aube-node')"
-          node --input-type=module -e "import { install } from '@jdxcode/aube-node'; if (typeof install !== 'function') process.exit(1)"
-          cp "$GITHUB_WORKSPACE/crates/aube-node/npm/typecheck.ts" .
+          node -e "const ffi=require('@jdxcode/aube-ffi'); require('fs').accessSync(ffi.libraryPath); require('fs').accessSync(ffi.headerPath)"
+          cp "$GITHUB_WORKSPACE/crates/aube-ffi/npm/typecheck.ts" .
           npx --yes --package=typescript@5.9.3 tsc --strict --noEmit \
             --lib ES2022,DOM --module NodeNext --moduleResolution NodeNext typecheck.ts
-          cd ..
-          mkdir bun-smoke
-          cd bun-smoke
-          bun init --yes >/dev/null
-          # Cross-compiling hosts install every optional target package before
-          # building their platform matrix.
-          bun install --os="*" --cpu="*" ../packages/*.tgz
-          bun -e "require('@jdxcode/aube-node')"
-          AUBE_NODE_OS=linux AUBE_NODE_ARCH=x64 AUBE_NODE_LIBC=glibc \
-            bun "$GITHUB_WORKSPACE/crates/aube-node/npm/compile-smoke.mjs"
-          test "$(stat --format=%s aube-node-smoke)" -lt 157286400
-          ./aube-node-smoke
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with: { name: aube-node-npm-packages, path: "packages/*.tgz", if-no-files-found: error }
+        with:
+          name: aube-ffi-distribution
+          path: |
+            packages/*.tgz
+            packages/libaube-*
+            packages/aube.h
+          if-no-files-found: error
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         if: github.event_name == 'release'
-        with: { subject-path: "packages/*.tgz" }
+        with:
+          subject-path: |
+            packages/*.tgz
+            packages/libaube-*
+            packages/aube.h
       - name: Publish platform and root packages
         if: github.event_name == 'release'
         shell: bash
@@ -199,4 +198,19 @@ jobs:
             npm publish "$package" --access public --provenance --tag "$tag"
           }
           for package in packages/*-darwin-*.tgz packages/*-linux-*.tgz packages/*-win32-*.tgz; do publish_package "$package"; done
-          publish_package "packages/jdxcode-aube-node-${version}.tgz"
+          publish_package "packages/jdxcode-aube-ffi-${version}.tgz"
+
+  release-assets:
+    if: github.event_name == 'release'
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with: { name: aube-ffi-distribution, path: packages }
+      - name: Attach C ABI assets to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" packages/libaube-* packages/aube.h --clobber
