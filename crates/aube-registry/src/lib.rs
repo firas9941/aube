@@ -3,6 +3,13 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+// The registry client is https-only; without a TLS backend every request
+// would fail at runtime with an opaque scheme error. Fail at compile time
+// instead so embedders disabling default features re-enable `rustls`
+// (the only supported backend — see the TLS policy in CLAUDE.md).
+#[cfg(not(feature = "rustls"))]
+compile_error!("aube-registry requires the `rustls` feature");
+
 // Visitor helper macros — each tolerant deserializer below picks the
 // subset that matches its custom handlers. Splitting these granularly
 // is what lets `funding_url` keep its own `visit_seq` (array case)
