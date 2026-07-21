@@ -24,6 +24,9 @@ pub enum RuntimeSource {
     /// No requirement configured (or policy said keep the ambient
     /// node) — PATH is left alone.
     PathFallback,
+    /// A host embedding aube (e.g. mise) supplied the node runtime to
+    /// use for lifecycle scripts, rather than aube resolving one itself.
+    Embedder,
 }
 
 impl RuntimeSource {
@@ -33,6 +36,7 @@ impl RuntimeSource {
             RuntimeSource::NodeVersionFile => ".node-version",
             RuntimeSource::Nvmrc => ".nvmrc",
             RuntimeSource::PathFallback => "PATH",
+            RuntimeSource::Embedder => "embedder",
         }
     }
 }
@@ -125,6 +129,61 @@ pub fn current() -> Option<Arc<RuntimeContext>> {
         Ok(runtime) => runtime,
         Err(_) => RUNTIME.get().map(Arc::clone),
     }
+}
+
+/// Seed the current install's runtime slot with a node binary supplied by an
+/// embedding host (e.g. mise), so lifecycle scripts spawn on that node and
+/// find it on PATH instead of relying on an ambient `node`.
+///
+/// `bin_dir` is the directory containing the `node` executable; it is
+/// prepended to the script PATH ([`path_entries`]) and its `node` is used as
+/// [`node_program`]. Must be called inside a [`scope`] (the install task) and
+/// before [`ensure`] runs — `ensure` returns early when the slot is already
+/// set, so this override wins without aube probing for its own runtime. A
+/// no-op outside a scope or if the slot is already populated.
+pub async fn seed_embedder_node(bin_dir: PathBuf) {
+    // No-op outside an install scope, or when the slot is already seeded.
+    // Check first so the path/version probing below is skipped entirely in
+    // those cases (a later `set` would be a no-op anyway).
+    let should_seed = INSTALL_RUNTIME
+        .try_with(|slot| slot.get().is_none())
+        .unwrap_or(false);
+    if !should_seed {
+        return;
+    }
+    // Absolutize: lifecycle scripts may run with a different working
+    // directory, so both `node_program()` and the prepended PATH entry must
+    // resolve independently of cwd. `absolute` doesn't require the dir to
+    // exist or touch symlinks; fall back to the input if it errors.
+    let bin_dir = std::path::absolute(&bin_dir).unwrap_or(bin_dir);
+    let node_exe = if cfg!(windows) { "node.exe" } else { "node" };
+    let node_bin = bin_dir.join(node_exe);
+    // Probe the supplied node for its version so engine checks and
+    // virtual-store hashing key off the *same* node as lifecycle scripts,
+    // instead of `effective_node_version` falling back to an ambient `node`.
+    // Async spawn so the install task doesn't block a Tokio worker on the
+    // child process.
+    let version = tokio::process::Command::new(&node_bin)
+        .arg("--version")
+        .output()
+        .await
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|v| v.trim().trim_start_matches('v').to_string())
+        .filter(|v| !v.is_empty());
+    let ctx = RuntimeContext {
+        node_bin: Some(node_bin),
+        bin_dir: Some(bin_dir),
+        version,
+        requested: None,
+        source: RuntimeSource::Embedder,
+        provenance: RuntimeProvenance::Mise,
+        fresh_pin: None,
+    };
+    let _ = INSTALL_RUNTIME.try_with(|slot| {
+        let _ = slot.set(Arc::new(ctx));
+    });
 }
 
 /// The node executable spawn sites should use: the switched runtime's
@@ -751,6 +810,45 @@ mod tests {
         let mut context = RuntimeContext::path_fallback();
         context.requested = Some(requested.to_string());
         context
+    }
+
+    #[tokio::test]
+    async fn seed_embedder_node_drives_node_program_and_path() {
+        scope(async {
+            assert!(current().is_none(), "slot starts empty");
+            let bin_dir = PathBuf::from("/opt/mise/node/bin");
+            seed_embedder_node(bin_dir.clone()).await;
+
+            // The seed absolutizes the dir; compute the expected the same way
+            // so this holds on Windows (where `/opt/...` isn't absolute).
+            let expected = std::path::absolute(&bin_dir).unwrap_or(bin_dir);
+            let node_exe = if cfg!(windows) { "node.exe" } else { "node" };
+
+            let ctx = current().expect("slot seeded");
+            assert_eq!(ctx.source, RuntimeSource::Embedder);
+            assert_eq!(ctx.bin_dir.as_deref(), Some(expected.as_path()));
+            assert_eq!(node_program(), expected.join(node_exe));
+            assert_eq!(path_entries(), vec![expected.clone()]);
+
+            // `ensure`-style early return: a second seed does not clobber the
+            // first (OnceCell is set once).
+            seed_embedder_node(PathBuf::from("/other")).await;
+            assert_eq!(node_program(), expected.join(node_exe));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn seed_embedder_node_is_a_noop_outside_scope() {
+        // No install scope active: the seed can't set a task-local slot, so it
+        // must not panic and must not leak into a later scope. Asserting via a
+        // fresh `scope` reads the (empty) task-local, not the process-wide
+        // `RUNTIME`, so this stays deterministic regardless of test order.
+        seed_embedder_node(PathBuf::from("/opt/mise/node/bin")).await;
+        scope(async {
+            assert!(current().is_none(), "seed outside a scope must not leak in");
+        })
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
