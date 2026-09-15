@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260 # v0.5.132
+        uses: release-plz/action@503fe65046e8810d4844f6b3aa12ab599a3549d7 # v0.5.134
         with:
           command: release
         env:
@@ -122,7 +122,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: ./.github/workflows/release.yml
+    uses: $/.github/workflows/release.yml
     with:
       tag: ${{ needs.release-plz-release.outputs.tag }}
     secrets:
@@ -149,7 +149,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    uses: ./.github/workflows/ffi.yml
+    uses: $/.github/workflows/ffi.yml
     with:
       tag: ${{ needs.release-plz-release.outputs.tag }}
       draft_phase: true
@@ -305,7 +305,7 @@ jobs:
           cache: false
         env:
           MISE_LOCKED: "1"
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2.87.8
         with:
           tool: release-plz
       # `release-plz update` shells out to `cargo package` inside temp
